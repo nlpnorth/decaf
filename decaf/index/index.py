@@ -4,6 +4,24 @@ from typing import Union
 
 from decaf.index import Atom, Structure
 
+#
+# helper functions
+#
+
+def requires_database(func):
+	# wrap function that uses the DB connection
+	def wrapped_func(self, **kwargs):
+		# check if function is called within an active database connection
+		if self.db_connection is None:
+			raise RuntimeError(f"The {func.__name__} function must be called within an active database connection context.")
+		return func(self, **kwargs)
+
+	return wrapped_func
+
+
+#
+# Main DECAF Index
+#
 
 class DecafIndex:
 	def __init__(self, db_path):
@@ -25,6 +43,7 @@ class DecafIndex:
 			self.db_connection.close()
 			self.db_connection = None
 
+	@requires_database
 	def add_atoms(self, atoms:list[Atom]):
 		cursor = self.db_connection.cursor()
 
@@ -33,6 +52,7 @@ class DecafIndex:
 
 		self.db_connection.commit()
 
+	@requires_database
 	def add_structures(self, structures:list[Structure]):
 		cursor = self.db_connection.cursor()
 
@@ -41,6 +61,7 @@ class DecafIndex:
 
 		self.db_connection.commit()
 
+	@requires_database
 	def get_size(self):
 		cursor = self.db_connection.cursor()
 
@@ -52,6 +73,7 @@ class DecafIndex:
 
 		return num_atoms, num_structures
 
+	@requires_database
 	def get_atom_counts(self):
 		cursor = self.db_connection.cursor()
 
@@ -60,6 +82,7 @@ class DecafIndex:
 
 		return atom_counts
 
+	@requires_database
 	def get_structure_counts(self):
 		cursor = self.db_connection.cursor()
 
@@ -67,3 +90,12 @@ class DecafIndex:
 		structure_counts = {t: c for t, c in cursor.fetchall()}
 
 		return structure_counts
+
+	@requires_database
+	def export_ranges(self, ranges):
+		cursor = self.db_connection.cursor()
+
+		for start, end in ranges:
+			query = 'SELECT GROUP_CONCAT(value, "") as export FROM atoms WHERE start >= ? AND end < ?'
+			cursor.execute(query, (start, end))
+			yield cursor.fetchone()[0]
