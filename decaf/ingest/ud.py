@@ -59,6 +59,7 @@ def parse_token(token:Token, cursor_idx:int) -> tuple[list[Atom], list[Structure
 		atoms.append(
 			Atom(start=cursor_idx + character_idx, end=cursor_idx + character_idx + 1, value=character)
 		)
+	trailing_space = True
 
 	# create structures from UD's token-level annotations
 	# https://universaldependencies.org/format.html
@@ -89,6 +90,10 @@ def parse_token(token:Token, cursor_idx:int) -> tuple[list[Atom], list[Structure
 						subsumes=False
 					)
 				)
+			# check for SpaceAfter=No MISC annotation
+			if ('SpaceAfter' in token[annotation]) and (token[annotation]['SpaceAfter'] == 'No'):
+				# prevent adding trailing space
+				trailing_space = False
 		# all other annotations are stored as token-level structures
 		else:
 			structures.append(
@@ -98,6 +103,9 @@ def parse_token(token:Token, cursor_idx:int) -> tuple[list[Atom], list[Structure
 					subsumes=False  # token-level annotations are not transitive w.r.t. individual characters
 				)
 			)
+
+	if trailing_space:
+		atoms.append(Atom(start=end_idx, end=end_idx + 1, value=' '))
 
 	return atoms, structures
 
