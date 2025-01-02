@@ -51,7 +51,7 @@ def get_carryover_field(field):
 # parser functions
 #
 
-def parse_token(token:Token, cursor_idx:int) -> tuple[list[Atom], list[Structure]]:
+def parse_token(token:Token, cursor_idx:int, trailing_space:Optional[bool] = None) -> tuple[list[Atom], list[Structure]]:
 	atoms, structures = [], []
 
 	# create atoms from characters
@@ -59,7 +59,7 @@ def parse_token(token:Token, cursor_idx:int) -> tuple[list[Atom], list[Structure
 		atoms.append(
 			Atom(start=cursor_idx + character_idx, end=cursor_idx + character_idx + 1, value=character)
 		)
-	trailing_space = True
+	trailing_space = True if trailing_space is None else trailing_space
 
 	# create structures from UD's token-level annotations
 	# https://universaldependencies.org/format.html
@@ -116,8 +116,25 @@ def parse_sentence(sentence:TokenList, cursor_idx:int) -> tuple[list[Atom], list
 
 	# parse tokens in sentence
 	token_cursor_idx = int(cursor_idx)
+	multitoken_end = None
+	multitoken_space = None
 	for token_idx, token in enumerate(sentence):
-		token_atoms, token_structures = parse_token(token, token_cursor_idx)
+		# check for multi-tokens (e.g. "It's" -> "It 's"), identified by ID with range (e.g., '3-4')
+		if type(token['id']) is tuple:
+			multitoken_end = token['id'][-1]
+			if (token['misc'] is not None) and ('SpaceAfter' in token['misc']) and (token['misc']['SpaceAfter'] == 'No'):
+				multitoken_space = False
+			continue
+		# trailing space behaviour follows default, except within and at the end of multi-tokens
+		trailing_space = None
+		if multitoken_end is not None:
+			trailing_space = False
+			if token['id'] >= multitoken_end:
+				trailing_space = multitoken_space
+				multitoken_end, multitoken_space = None, None
+
+		# process token
+		token_atoms, token_structures = parse_token(token, token_cursor_idx, trailing_space=trailing_space)
 		atoms += token_atoms
 		structures += token_structures
 		token_cursor_idx += len(token_atoms)
