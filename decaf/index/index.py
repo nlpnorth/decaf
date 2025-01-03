@@ -82,68 +82,151 @@ class DecafIndex:
 	# filtering functions
 	#
 
-	@requires_database
-	def filter(self, constraint, constraint_level = None, output_level = None):
-		cursor = self.db_connection.cursor()
+	@staticmethod
+	def _construct_views(constraint, constraint_level):
+		#
+		# SQL Sub-queries Mega Block
+		#
 
-		# case: no structural constrain is provided
+		views = {}
+
+		# view containing all potentially relevant structures (w/o literals)
+		# e.g., all upos=(NOUN|ADJ)
+		relevant_structures_view = f'''
+		SELECT id AS match_id, start, end, type, value
+        FROM structures
+        WHERE {constraint.to_prefilter_sql()}
+		'''
+
+		# view containing all potentially relevant structures (w/o literals) which are contained within the specified parent constraint level
+		# e.g., all structures subsumed by 'sentence', which contain at least one upos=(NOUN|ADJ)
+		if constraint_level is not None:
+			relevant_structures_view = f'''
+		    SELECT structural_constraint_id, structural_constraint_start, structural_constraint_end, match_id, start, end, type, value
+		    FROM ({relevant_structures_view})
+		    JOIN (
+		        SELECT id AS structural_constraint_id, start AS structural_constraint_start, end AS structural_constraint_end
+		        FROM structures
+		        WHERE type = "{constraint_level}"
+		        )
+		    ON (start >= structural_constraint_start AND end <= structural_constraint_end)'''
+
+		views['relevant_structures'] = relevant_structures_view
+
+		# set the relevant view depending on whether literals are involved or not
+		relevant_view = 'relevant_structures'
+
+		# views for handling constraints with literals
+		if constraint.has_literals():
+			# view containing all potentially relevant structures + their literals for structures for which literals were queried (otherwise NULL)
+			# e.g., all relevant structures + literals for all upos=ADJ, but not for upos=NULL
+			relevant_literals_view = f'''
+			SELECT {'relevant.structural_constraint_id AS structural_constraint_id, relevant.structural_constraint_start AS structural_constraint_start, relevant.structural_constraint_end AS structural_constraint_end,' if constraint_level is not None else ''} relevant.match_id AS match_id, relevant.start AS start, relevant.end AS end, relevant.type AS type, relevant.value AS value, literal
+		    FROM
+		        relevant_structures AS relevant
+		    LEFT JOIN (
+		        SELECT {'structural_constraint_id, structural_constraint_start, structural_constraint_end,' if constraint_level is not None else ''} relevant_structures.match_id AS id, relevant_structures.start AS start, relevant_structures.type AS type, relevant_structures.value AS value, GROUP_CONCAT(atoms.value, '') as literal
+		        FROM
+		            relevant_structures
+		        JOIN
+		            atoms
+		        ON (atoms.start >= relevant_structures.start AND atoms.end <= relevant_structures.end AND ({constraint.to_prefilter_sql(only_literals=True, column_prefix='relevant_structures.')}))
+		        GROUP BY relevant_structures.match_id) AS literals
+		    ON (relevant.match_id = literals.id)'''
+
+			views['relevant_literals'] = relevant_literals_view
+			relevant_view = 'relevant_literals'
+
+		# views for handling constraint application at specific structural levels
+		if constraint_level is not None:
+			# view containing all parent structures, which fulfill all substructural constraints
+			# e.g., all sentences containing at least one upos=(ADJ|NOUN) each
+			filtered_structures_view = f'''
+			SELECT structural_constraint_id, structural_constraint_start, structural_constraint_end
+	        FROM {relevant_view}
+	        GROUP BY structural_constraint_id
+	        HAVING ({constraint.to_grouped_sql()})'''
+
+			views['filtered_structures'] = filtered_structures_view
+
+			# view containing all substructures which matched the criterion within the parent structural constraint
+			# e.g., all upos=(ADJ|NOUN) within all sentences, that contain at least one of each
+			filtered_substructures_view = f'''
+			SELECT match_id, start, end
+		    FROM 
+		        relevant_structures AS relevant
+		    JOIN
+		        filtered_structures AS filtered
+		    ON (filtered.structural_constraint_id = relevant.structural_constraint_id)'''
+
+			views['filtered_substructures'] = filtered_substructures_view
+
+		# construct query prefix with all available views
+		views = 'WITH ' + '\n, '.join(f'{name} AS ({definition})' for name, definition in views.items()) + '\n'
+
+		return views
+
+	def _construct_filter_query(self, constraint, constraint_level, output_level):
+		#
+		# SQL Query Construction Logic
+		#
+		views = self._construct_views(constraint=constraint, constraint_level=constraint_level)
+		relevant_view = 'relevant_literals' if constraint.has_literals() else 'relevant_structures'
+
+		# case: no structural constraint is provided
 		if constraint_level is None:
-			# retrieves any structures matching the constraint
-			query = f'''
-			SELECT id, start, end
-	        FROM structures
-	        WHERE {constraint.to_sql()}'''
+			# case: retrieve all matching structures
+			query = f'SELECT match_id, start, end FROM {relevant_view} WHERE {constraint.to_sql()}'
 
-			# case: output level differs from the constraint level
+			# case: output level differs from the level of the matched constraints
 			if output_level is not None:
 				query = f'''
 				SELECT DISTINCT outputs.id, outputs.start, outputs.end
 				FROM structures AS outputs
 				JOIN ({query}) AS filtered ON (outputs.start <= filtered.start AND outputs.end >= filtered.end)
-				WHERE type = "{output_level}"'''
+				WHERE outputs.type = "{output_level}"'''
 
 		# case: constraint should be applied within a specific structural level
 		else:
-			# retrieves structures which contain substructures that match the constraint
-			relevant_structures_query = f'''
-			WITH relevant_structures AS (
-			    SELECT structural_constraint_id, structural_constraint_start, structural_constraint_end, match_id, start, end, type, value
-			    FROM (
-			        SELECT id AS match_id, start, end, type, value
-			        FROM structures
-			        WHERE {constraint.to_sql()}
-			         )
-			    JOIN (
-			        SELECT id AS structural_constraint_id, start AS structural_constraint_start, end AS structural_constraint_end
-			        FROM structures
-			        WHERE type = "{constraint_level}"
-			    ) ON (start >= structural_constraint_start AND end <= structural_constraint_end)
-			)'''
-
 			# case: output should be at the level of the constraining structure
-			filtered_structures_query = f'''
-			SELECT structural_constraint_id AS filtered_structural_constraint_id, structural_constraint_start, structural_constraint_end
-		    FROM relevant_structures
-		    GROUP BY structural_constraint_id
-			HAVING ({constraint.to_grouped_sql()})'''
+			query = 'SELECT * FROM filtered_structures'
 
 			# case: output should be at the level of the matching substructures
 			if output_level is None:
-				filtered_structures_query = f'''
-				SELECT match_id, start, end
-				FROM relevant_structures
-				JOIN ({filtered_structures_query})
-				ON (filtered_structural_constraint_id = structural_constraint_id)'''
-			elif (output_level is not None) and (output_level != constraint_level):
-				raise NotImplementedError(f"For structurally constrained queries, output levels besides the constraint or match level are unsupported. Specified output level: '{output_level}'.")
+				query = 'SELECT * FROM filtered_substructures'
 
-			# complete full query
-			query = relevant_structures_query + filtered_structures_query
+			# case: output level does not match the constraint level
+			elif (output_level is not None) and (output_level != constraint_level):
+				raise NotImplementedError(
+					f"For structurally constrained queries, output levels besides the constraint or match level are unsupported. Specified output level: '{output_level}'.")
+
+		# prefix available views to query
+		query = views + query
+
+		return query
+
+	@requires_database
+	def get_filter_ranges(self, constraint, constraint_level, output_level):
+		cursor = self.db_connection.cursor()
 
 		# execute constructed query
+		query = self._construct_filter_query(
+			constraint=constraint,
+			constraint_level=constraint_level,
+			output_level=output_level
+		)
 		cursor.execute(query)
 
-		for structure_id, start, end in cursor.fetchall():
+		return cursor.fetchall()
+
+	@requires_database
+	def filter(self, constraint, constraint_level = None, output_level = None):
+		filter_ranges = self.get_filter_ranges(
+			constraint=constraint,
+			constraint_level=constraint_level,
+			output_level=output_level
+		)
+		for structure_id, start, end in filter_ranges:
 			yield structure_id, start, end, next(self.export_ranges([(start, end)]))
 
 	#
