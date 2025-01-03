@@ -10,11 +10,11 @@ from decaf.index import Atom, Structure
 
 def requires_database(func):
 	# wrap function that uses the DB connection
-	def wrapped_func(self, **kwargs):
+	def wrapped_func(self, *args, **kwargs):
 		# check if function is called within an active database connection
 		if self.db_connection is None:
 			raise RuntimeError(f"The {func.__name__} function must be called within an active database connection context.")
-		return func(self, **kwargs)
+		return func(self, *args, **kwargs)
 
 	return wrapped_func
 
@@ -43,6 +43,10 @@ class DecafIndex:
 			self.db_connection.close()
 			self.db_connection = None
 
+	#
+	# import functions
+	#
+
 	@requires_database
 	def add_atoms(self, atoms:list[Atom]):
 		cursor = self.db_connection.cursor()
@@ -60,6 +64,91 @@ class DecafIndex:
 		cursor.executemany(query, [structure.serialize() for structure in structures])
 
 		self.db_connection.commit()
+
+	#
+	# export functions
+	#
+
+	@requires_database
+	def export_ranges(self, ranges):
+		cursor = self.db_connection.cursor()
+
+		for start, end in ranges:
+			query = 'SELECT GROUP_CONCAT(value, "") as export FROM atoms WHERE start >= ? AND end <= ?'
+			cursor.execute(query, (start, end))
+			yield cursor.fetchone()[0]
+
+	#
+	# filtering functions
+	#
+
+	@requires_database
+	def filter(self, constraint, constraint_level = None, output_level = None):
+		cursor = self.db_connection.cursor()
+
+		# case: no structural constrain is provided
+		if constraint_level is None:
+			# retrieves any structures matching the constraint
+			query = f'''
+			SELECT id, start, end
+	        FROM structures
+	        WHERE {constraint.to_sql()}'''
+
+			# case: output level differs from the constraint level
+			if output_level is not None:
+				query = f'''
+				SELECT DISTINCT outputs.id, outputs.start, outputs.end
+				FROM structures AS outputs
+				JOIN ({query}) AS filtered ON (outputs.start <= filtered.start AND outputs.end >= filtered.end)
+				WHERE type = "{output_level}"'''
+
+		# case: constraint should be applied within a specific structural level
+		else:
+			# retrieves structures which contain substructures that match the constraint
+			relevant_structures_query = f'''
+			WITH relevant_structures AS (
+			    SELECT structural_constraint_id, structural_constraint_start, structural_constraint_end, match_id, start, end, type, value
+			    FROM (
+			        SELECT id AS match_id, start, end, type, value
+			        FROM structures
+			        WHERE {constraint.to_sql()}
+			         )
+			    JOIN (
+			        SELECT id AS structural_constraint_id, start AS structural_constraint_start, end AS structural_constraint_end
+			        FROM structures
+			        WHERE type = "{constraint_level}"
+			    ) ON (start >= structural_constraint_start AND end <= structural_constraint_end)
+			)'''
+
+			# case: output should be at the level of the constraining structure
+			filtered_structures_query = f'''
+			SELECT structural_constraint_id AS filtered_structural_constraint_id, structural_constraint_start, structural_constraint_end
+		    FROM relevant_structures
+		    GROUP BY structural_constraint_id
+			HAVING ({constraint.to_grouped_sql()})'''
+
+			# case: output should be at the level of the matching substructures
+			if output_level is None:
+				filtered_structures_query = f'''
+				SELECT match_id, start, end
+				FROM relevant_structures
+				JOIN ({filtered_structures_query})
+				ON (filtered_structural_constraint_id = structural_constraint_id)'''
+			elif (output_level is not None) and (output_level != constraint_level):
+				raise NotImplementedError(f"For structurally constrained queries, output levels besides the constraint or match level are unsupported. Specified output level: '{output_level}'.")
+
+			# complete full query
+			query = relevant_structures_query + filtered_structures_query
+
+		# execute constructed query
+		cursor.execute(query)
+
+		for structure_id, start, end in cursor.fetchall():
+			yield structure_id, start, end, next(self.export_ranges([(start, end)]))
+
+	#
+	# statistics functions
+	#
 
 	@requires_database
 	def get_size(self):
@@ -90,12 +179,3 @@ class DecafIndex:
 		structure_counts = {t: c for t, c in cursor.fetchall()}
 
 		return structure_counts
-
-	@requires_database
-	def export_ranges(self, ranges):
-		cursor = self.db_connection.cursor()
-
-		for start, end in ranges:
-			query = 'SELECT GROUP_CONCAT(value, "") as export FROM atoms WHERE start >= ? AND end < ?'
-			cursor.execute(query, (start, end))
-			yield cursor.fetchone()[0]
