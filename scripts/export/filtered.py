@@ -1,5 +1,7 @@
 import argparse
 
+import sqlparse
+
 from decaf.index import DecafIndex, Criterion, Condition
 
 
@@ -20,39 +22,75 @@ def main():
 	print(f"Connected to DECAF index at '{args.index}'.")
 
 	# construct criterion
+	constraint_level = 'sentence'
+	output_level = 'sentence'
+	# match structures of type "upos" with values "ADJ" or "NOUN"
+	# constraint = Criterion(
+	# 	conditions=[
+	# 		Condition(stype='upos', values=['ADJ', 'NOUN'])
+	# 	]
+	# )
+	# match structures of type "upos" with values "ADJ" with literal "second" and "NOUN"
 	constraint = Criterion(
+		operation='AND',
 		conditions=[
-			Condition(stype='upos', values=['ADJ', 'NOUN'])
+			Condition(stype='upos', values=['ADJ'], literal="second"),
+			Condition(stype='upos', values=['NOUN'])
 		]
 	)
+	# constraint = Criterion(
+	# 	operation='AND',
+	# 	conditions=[
+	# 		Condition(stype='upos', values=['ADJ', 'NOUN']),
+	# 		Criterion(
+	# 			conditions=[
+	# 				Condition(stype='upos', values=['DET'])
+	# 			]
+	# 		)
+	# 	]
+	# )
 
 	with decaf_index as di:
+		print("Constructed SQL query from constraints:")
+		print('```')
+		print(sqlparse.format(di._construct_filter_query(
+			constraint=constraint,
+			constraint_level=constraint_level,
+			output_level=output_level
+		), reindent=True, keyword_case='upper'))
+		print('```')
+		print("Querying index...")
+
 		# return all matching structures
-		# outputs = di.filter_new(
+		# outputs = di.filter(
 		# 	constraint=constraint
 		# )
 
 		# return all sentences containing matching structures
-		# outputs = di.filter_new(
+		# outputs = di.filter(
 		# 	constraint=constraint,
-		# 	output_level='sentence'
+		# 	output_level=output_level
 		# )
 
 		# return all matching structures which occur together within one sentence
-		# outputs = di.filter_new(
+		# outputs = di.filter(
 		# 	constraint=constraint,
-		# 	constraint_level='sentence'
+		# 	constraint_level=constraint_level
 		# )
 
 		# return all matching structures which occur together within one sentence
 		outputs = di.filter(
 			constraint=constraint,
-			constraint_level='sentence',
-			output_level='sentence'
+			constraint_level=constraint_level,
+			output_level=output_level
 		)
 
+		num_matches = 0
 		for sid, start, end, export in outputs:
-			print(f"[ID {sid} | {start}-{end}] '{export}'\n")
+			print(f"\n[ID {sid} | {start}-{end}] '{export}'")
+			num_matches += 1
+
+	print(f"\nCompleted retrieval of {num_matches} match(es) from index.")
 
 
 if __name__ == '__main__':
