@@ -1,6 +1,6 @@
 import sqlite3
 
-from typing import Union
+import pandas as pd
 
 from decaf.index import Atom, Structure
 
@@ -262,3 +262,38 @@ class DecafIndex:
 		structure_counts = {t: c for t, c in cursor.fetchall()}
 
 		return structure_counts
+
+	@requires_database
+	def get_cooccurence(self, source_constraint, target_constraint):
+		query = f'''
+		WITH source_structures AS (
+		    SELECT start, end, type, value
+		    FROM structures
+		    WHERE {source_constraint.to_sql()}
+		), target_structures AS (
+		    SELECT start, end, type, value
+		    FROM structures
+		    WHERE {target_constraint.to_sql()}
+		)
+		SELECT
+	        ss.type || '=' || ss.value as sources,
+	        ts.type || '=' || ts.value as targets,
+	        COUNT(*) as frequency
+		FROM
+		    source_structures AS ss
+		    JOIN
+		    target_structures AS ts
+		    ON (ss.start = ts.start AND ss.end = ts.end)
+		GROUP BY ss.type, ss.value, ts.type, ts.value;
+		'''
+		cooccurrence = pd.read_sql_query(query, self.db_connection)
+
+		# pivot co-occurrence rows to become a matrix
+		cooccurrence = cooccurrence.pivot(
+		    index='sources',
+		    columns='targets',
+		    values='frequency'
+		).fillna(0)
+		cooccurrence = cooccurrence.astype(int)
+
+		return cooccurrence

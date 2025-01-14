@@ -1,2 +1,5 @@
 conllu
+numpy
+pandas
+scipy
 sqlparse

@@ -1,5 +1,5 @@
 class Condition:
-	def __init__(self, stype, values, literal=None, min_count=0):
+	def __init__(self, stype, values=None, literal=None, min_count=0):
 		self.type = stype
 		self.values = values
 		self.literal = literal
@@ -9,8 +9,10 @@ class Condition:
 		return self.literal is not None
 
 	def to_sql(self):
-		query_set = '(' + ', '.join(f'"{v}"' for v in self.values) + ')'
-		sql = f'type = "{self.type}" AND value IN {query_set}'
+		sql = f'type = "{self.type}"'
+		if self.values is not None:
+			query_set = '(' + ', '.join(f'"{v}"' for v in self.values) + ')'
+			sql += f' AND value IN {query_set}'
 		# add literal if not pre-filtering
 		if self.literal is not None:
 			sql += f' AND literal = "{self.literal}"'
