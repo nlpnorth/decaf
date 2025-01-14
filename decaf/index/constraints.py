@@ -19,21 +19,16 @@ class Condition:
 		return sql
 
 	def to_grouped_sql(self):
-		count_conditions = []
-		for v in self.values:
-			count_condition = f'type = "{self.type}" AND value = "{v}"'
-			if self.literal is not None:
-				count_condition += f' AND literal = "{self.literal}"'
-			count_condition = f'SUM(CASE WHEN {count_condition} THEN 1 ELSE 0 END) > {self.min_count}'
-			count_conditions.append(count_condition)
-		sql = ' AND '.join(count_conditions)
+		sql = f'SUM(CASE WHEN ({self.to_sql()}) THEN 1 ELSE 0 END) > {self.min_count}'
 		return sql
 
 	def to_prefilter_sql(self, only_literals=False, column_prefix=''):
 		if only_literals and (self.literal is None):
 			return ''
-		query_set = '(' + ', '.join(f'"{v}"' for v in self.values) + ')'
-		sql = f'{column_prefix}type = "{self.type}" AND {column_prefix}value IN {query_set}'
+		sql = f'{column_prefix}type = "{self.type}"'
+		if self.values is not None:
+			query_set = '(' + ', '.join(f'"{v}"' for v in self.values) + ')'
+			sql += f' AND {column_prefix}value IN {query_set}'
 		return sql
 
 

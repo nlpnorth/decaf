@@ -83,7 +83,7 @@ class DecafIndex:
 	#
 
 	@staticmethod
-	def _construct_views(constraint, constraint_level):
+	def _construct_views(constraint, constraint_level, view_prefix=''):
 		#
 		# SQL Sub-queries Mega Block
 		#
@@ -93,7 +93,7 @@ class DecafIndex:
 		# view containing all potentially relevant structures (w/o literals)
 		# e.g., all upos=(NOUN|ADJ)
 		relevant_structures_view = f'''
-		SELECT id AS match_id, start, end, type, value
+		SELECT id AS substructure_id, start, end, type, value
         FROM structures
         WHERE {constraint.to_prefilter_sql()}
 		'''
@@ -102,49 +102,49 @@ class DecafIndex:
 		# e.g., all structures subsumed by 'sentence', which contain at least one upos=(NOUN|ADJ)
 		if constraint_level is not None:
 			relevant_structures_view = f'''
-		    SELECT structural_constraint_id, structural_constraint_start, structural_constraint_end, match_id, start, end, type, value
+		    SELECT structure_id, structure_start, structure_end, substructure_id, start, end, type, value
 		    FROM ({relevant_structures_view})
 		    JOIN (
-		        SELECT id AS structural_constraint_id, start AS structural_constraint_start, end AS structural_constraint_end
+		        SELECT id AS structure_id, start AS structure_start, end AS structure_end
 		        FROM structures
 		        WHERE type = "{constraint_level}"
 		        )
-		    ON (start >= structural_constraint_start AND end <= structural_constraint_end)'''
+		    ON (start >= structure_start AND end <= structure_end)'''
 
 		views['relevant_structures'] = relevant_structures_view
 
 		# set the relevant view depending on whether literals are involved or not
-		relevant_view = 'relevant_structures'
+		relevant_view = f'{view_prefix}relevant_structures'
 
 		# views for handling constraints with literals
 		if constraint.has_literals():
 			# view containing all potentially relevant structures + their literals for structures for which literals were queried (otherwise NULL)
 			# e.g., all relevant structures + literals for all upos=ADJ, but not for upos=NULL
 			relevant_literals_view = f'''
-			SELECT {'relevant.structural_constraint_id AS structural_constraint_id, relevant.structural_constraint_start AS structural_constraint_start, relevant.structural_constraint_end AS structural_constraint_end,' if constraint_level is not None else ''} relevant.match_id AS match_id, relevant.start AS start, relevant.end AS end, relevant.type AS type, relevant.value AS value, literal
+			SELECT {'relevant.structure_id AS structure_id, relevant.structure_start AS structure_start, relevant.structure_end AS structure_end,' if constraint_level is not None else ''} relevant.substructure_id AS substructure_id, relevant.start AS start, relevant.end AS end, relevant.type AS type, relevant.value AS value, literal
 		    FROM
-		        relevant_structures AS relevant
+		        {view_prefix}relevant_structures AS relevant
 		    LEFT JOIN (
-		        SELECT {'structural_constraint_id, structural_constraint_start, structural_constraint_end,' if constraint_level is not None else ''} relevant_structures.match_id AS id, relevant_structures.start AS start, relevant_structures.type AS type, relevant_structures.value AS value, GROUP_CONCAT(atoms.value, '') as literal
+		        SELECT {'structure_id, structure_start, structure_end,' if constraint_level is not None else ''} relevant_structures.substructure_id AS id, relevant_structures.start AS start, relevant_structures.type AS type, relevant_structures.value AS value, GROUP_CONCAT(atoms.value, '') as literal
 		        FROM
-		            relevant_structures
+		            {view_prefix}relevant_structures AS relevant_structures
 		        JOIN
 		            atoms
 		        ON (atoms.start >= relevant_structures.start AND atoms.end <= relevant_structures.end AND ({constraint.to_prefilter_sql(only_literals=True, column_prefix='relevant_structures.')}))
-		        GROUP BY relevant_structures.match_id) AS literals
-		    ON (relevant.match_id = literals.id)'''
+		        GROUP BY relevant_structures.substructure_id) AS literals
+		    ON (relevant.substructure_id = literals.id)'''
 
 			views['relevant_literals'] = relevant_literals_view
-			relevant_view = 'relevant_literals'
+			relevant_view = f'{view_prefix}relevant_literals'
 
 		# views for handling constraint application at specific structural levels
 		if constraint_level is not None:
 			# view containing all parent structures, which fulfill all substructural constraints
 			# e.g., all sentences containing at least one upos=(ADJ|NOUN) each
 			filtered_structures_view = f'''
-			SELECT structural_constraint_id, structural_constraint_start, structural_constraint_end
+			SELECT structure_id, structure_start, structure_end
 	        FROM {relevant_view}
-	        GROUP BY structural_constraint_id
+	        GROUP BY structure_id
 	        HAVING ({constraint.to_grouped_sql()})'''
 
 			views['filtered_structures'] = filtered_structures_view
@@ -152,17 +152,17 @@ class DecafIndex:
 			# view containing all substructures which matched the criterion within the parent structural constraint
 			# e.g., all upos=(ADJ|NOUN) within all sentences, that contain at least one of each
 			filtered_substructures_view = f'''
-			SELECT match_id, start, end
+			SELECT relevant.structure_id AS structure_id, substructure_id, start, end, type, value
 		    FROM 
-		        relevant_structures AS relevant
+		        {view_prefix}relevant_structures AS relevant
 		    JOIN
-		        filtered_structures AS filtered
-		    ON (filtered.structural_constraint_id = relevant.structural_constraint_id)'''
+		        {view_prefix}filtered_structures AS filtered
+		    ON (filtered.structure_id = relevant.structure_id)'''
 
 			views['filtered_substructures'] = filtered_substructures_view
 
 		# construct query prefix with all available views
-		views = 'WITH ' + '\n, '.join(f'{name} AS ({definition})' for name, definition in views.items()) + '\n'
+		views = 'WITH ' + '\n, '.join(f'{view_prefix}{name} AS ({definition})' for name, definition in views.items()) + '\n'
 
 		return views
 
@@ -176,7 +176,7 @@ class DecafIndex:
 		# case: no structural constraint is provided
 		if constraint_level is None:
 			# case: retrieve all matching structures
-			query = f'SELECT match_id, start, end FROM {relevant_view} WHERE {constraint.to_sql()}'
+			query = f'SELECT substructure_id, start, end FROM {relevant_view} WHERE {constraint.to_sql()}'
 
 			# case: output level differs from the level of the matched constraints
 			if output_level is not None:
@@ -189,11 +189,11 @@ class DecafIndex:
 		# case: constraint should be applied within a specific structural level
 		else:
 			# case: output should be at the level of the constraining structure
-			query = 'SELECT * FROM filtered_structures'
+			query = 'SELECT structure_id, structure_start, structure_end FROM filtered_structures'
 
 			# case: output should be at the level of the matching substructures
 			if output_level is None:
-				query = 'SELECT * FROM filtered_substructures'
+				query = 'SELECT substructure_id, start, end FROM filtered_substructures'
 
 			# case: output level does not match the constraint level
 			elif (output_level is not None) and (output_level != constraint_level):
@@ -264,28 +264,32 @@ class DecafIndex:
 		return structure_counts
 
 	@requires_database
-	def get_cooccurence(self, source_constraint, target_constraint):
+	def get_cooccurence(self, source_constraint, target_constraint, constraint_level=None):
+		# prepare views for easier retrieval
+		source_views = self._construct_views(constraint=source_constraint, constraint_level=constraint_level, view_prefix='source_')
+		target_views = self._construct_views(constraint=target_constraint, constraint_level=constraint_level, view_prefix='target_')
+
+		# select the relevant view based on constraints
+		relevant_view = 'relevant_structures'  # default: relevant structures without constraint
+		join_criterion = 'srv.start = trv.start AND srv.end = trv.end'  # default: structures occurring at matching positions
+		if constraint_level is not None:
+			relevant_view = 'filtered_substructures'
+			join_criterion = 'srv.structure_id = trv.structure_id'  # match at the level of parent structures (e.g., sentences)
+
+		# construct final query
 		query = f'''
-		WITH source_structures AS (
-		    SELECT start, end, type, value
-		    FROM structures
-		    WHERE {source_constraint.to_sql()}
-		), target_structures AS (
-		    SELECT start, end, type, value
-		    FROM structures
-		    WHERE {target_constraint.to_sql()}
-		)
 		SELECT
-	        ss.type || '=' || ss.value as sources,
-	        ts.type || '=' || ts.value as targets,
+	        srv.type || '=' || srv.value as sources,
+	        trv.type || '=' || trv.value as targets,
 	        COUNT(*) as frequency
 		FROM
-		    source_structures AS ss
+		    source_{relevant_view} AS srv
 		    JOIN
-		    target_structures AS ts
-		    ON (ss.start = ts.start AND ss.end = ts.end)
-		GROUP BY ss.type, ss.value, ts.type, ts.value;
+		    target_{relevant_view} AS trv
+		    ON ({join_criterion})
+		GROUP BY srv.type, srv.value, trv.type, trv.value;
 		'''
+		query = source_views + ', ' + target_views[5:] + query
 		cooccurrence = pd.read_sql_query(query, self.db_connection)
 
 		# pivot co-occurrence rows to become a matrix

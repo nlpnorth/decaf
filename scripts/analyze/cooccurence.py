@@ -9,6 +9,7 @@ def parse_arguments():
 	parser.add_argument('--index', required=True, help='path to SQLite DECAF index')
 	parser.add_argument('--source-types', nargs='+', help='list of source annotation types')
 	parser.add_argument('--target-types', nargs='+', help='list of target annotation types')
+	parser.add_argument('--constraint-level', help='level at which to apply constraints')
 	return parser.parse_args()
 
 
@@ -45,7 +46,8 @@ def main():
 		query_start_time = time.time()
 		cooccurrence = di.get_cooccurence(
 			source_constraint=source_constraint,
-			target_constraint=target_constraint
+			target_constraint=target_constraint,
+			constraint_level=args.constraint_level
 		)
 		print("Co-occurrence:")
 		print(cooccurrence)
