@@ -3,7 +3,8 @@ import time
 
 import sqlparse
 
-from decaf.index import DecafIndex, Criterion, Condition
+from decaf.index import DecafIndex
+from decaf.constraints import Constraint, Criterion, Condition
 
 
 def parse_arguments():
@@ -22,7 +23,6 @@ def main():
 	decaf_index = DecafIndex(db_path=args.index)
 
 	# construct criterion
-	constraint_level = 'sentence'
 	output_level = 'sentence'
 	# match structures of type "upos" with values "ADJ" or "NOUN"
 	# constraint = Criterion(
@@ -31,24 +31,29 @@ def main():
 	# 	]
 	# )
 	# match structures of type "upos" with values "ADJ" with literal "second" and "NOUN"
-	constraint = Criterion(
-		operation='AND',
-		conditions=[
-			Condition(stype='upos', values=['ADJ'], literal="second"),
-			Condition(stype='upos', values=['NOUN'])
-		]
+	constraint = Constraint(
+		criteria=[
+			Criterion(
+				conditions=[
+					Condition(stype='upos', values=['DET'], literals=['the'])
+				]
+			),
+			Criterion(
+				conditions=[
+					Condition(stype='upos', values=['ADJ'])
+				]
+			),
+			Criterion(
+				operation='AND',
+				conditions=[
+					Condition(stype='upos', values=['NOUN']),
+					Condition(stype='Number', values=['Plur'])
+				]
+			)
+		],
+		level='sentence',
+		sequential=True
 	)
-	# constraint = Criterion(
-	# 	operation='AND',
-	# 	conditions=[
-	# 		Condition(stype='upos', values=['ADJ', 'NOUN']),
-	# 		Criterion(
-	# 			conditions=[
-	# 				Condition(stype='upos', values=['DET'])
-	# 			]
-	# 		)
-	# 	]
-	# )
 
 	with decaf_index as di:
 		num_atoms, num_structures = decaf_index.get_size()
@@ -56,36 +61,17 @@ def main():
 
 		print("Constructed SQL query from constraints:")
 		print('```')
-		print(sqlparse.format(di._construct_filter_query(
+		sql = sqlparse.format(di._construct_filter_query(
 			constraint=constraint,
-			constraint_level=constraint_level,
 			output_level=output_level
-		), reindent=True, keyword_case='upper'))
+		), reindent=True, keyword_case='upper')
+		print(sql)
 		print('```')
 		print("Querying index...")
 		query_start_time = time.time()
 
-		# return all matching structures
-		# outputs = di.filter(
-		# 	constraint=constraint
-		# )
-
-		# return all sentences containing matching structures
-		# outputs = di.filter(
-		# 	constraint=constraint,
-		# 	output_level=output_level
-		# )
-
-		# return all matching structures which occur together within one sentence
-		# outputs = di.filter(
-		# 	constraint=constraint,
-		# 	constraint_level=constraint_level
-		# )
-
-		# return all matching structures which occur together within one sentence
 		outputs = di.filter(
 			constraint=constraint,
-			constraint_level=constraint_level,
 			output_level=output_level
 		)
 

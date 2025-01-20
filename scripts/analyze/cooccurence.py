@@ -1,7 +1,8 @@
 import argparse
 import time
 
-from decaf.index import DecafIndex, Criterion, Condition
+from decaf.index import DecafIndex
+from decaf.constraints import Constraint, Criterion, Condition
 
 
 def parse_arguments():
@@ -23,13 +24,23 @@ def main():
 	decaf_index = DecafIndex(db_path=args.index)
 
 	# set up types to compute co-occurrence for
-	source_constraint = Criterion(
-		operation='OR',
-	    conditions=[Condition(stype=t) for t in args.source_types]
+	source_constraint = Constraint(
+		criteria=[
+			Criterion(
+				operation='OR',
+			    conditions=[Condition(stype=t) for t in args.source_types]
+			)
+		],
+		level=args.constraint_level
 	)
-	target_constraint =  Criterion(
-		operation='OR',
-	    conditions=[Condition(stype=t) for t in args.target_types]
+	target_constraint = Constraint(
+		criteria=[
+			Criterion(
+				operation='OR',
+			    conditions=[Condition(stype=t) for t in args.source_types]
+			)
+		],
+		level=args.constraint_level
 	)
 
 	with decaf_index as di:
@@ -46,8 +57,7 @@ def main():
 		query_start_time = time.time()
 		cooccurrence = di.get_cooccurence(
 			source_constraint=source_constraint,
-			target_constraint=target_constraint,
-			constraint_level=args.constraint_level
+			target_constraint=target_constraint
 		)
 		print("Co-occurrence:")
 		print(cooccurrence)
