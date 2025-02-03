@@ -1,9 +1,9 @@
 import sqlite3
 
 import pandas as pd
-from bleach.callbacks import target_blank
+from pycparser.ply.cpp import literals
 
-from decaf.index import Atom, Structure
+from decaf.index import Literal, Structure
 from decaf.index.views import construct_views
 
 #
@@ -50,20 +50,58 @@ class DecafIndex:
 	#
 
 	@requires_database
-	def add_atoms(self, atoms:list[Atom]):
+	def add_literals(self, literals:list[Literal]) -> list[Literal]:
 		cursor = self.db_connection.cursor()
 
-		query = 'INSERT INTO atoms (id, start, end, value) VALUES (?, ?, ?, ?)'
-		cursor.executemany(query, [atom.serialize() for atom in atoms])
+		for literal in literals:
+			# skip literals which already have an entry in the index (i.e., ID that is not None)
+			if literal.id is not None:
+				continue
+			# insert literal into table and get insertion ID
+			query = 'INSERT INTO literals (id, start, end, value) VALUES (?, ?, ?, ?)'
+			cursor.execute(query, literal.serialize())
+			literal.id = int(cursor.lastrowid)
 
 		self.db_connection.commit()
+
+		return literals
 
 	@requires_database
 	def add_structures(self, structures:list[Structure]):
 		cursor = self.db_connection.cursor()
 
-		query = 'INSERT INTO structures (id, start, end, value, type, subsumes) VALUES (?, ?, ?, ?, ?, ?)'
-		cursor.executemany(query, [structure.serialize() for structure in structures])
+		structure_literals = []
+		for structure in structures:
+			assert all((literal.id is not None) for literal in structure.literals), f"[Error] Please make sure to add all literals to the index before adding the corresponding structures."
+
+			# skip structures which already have an entry in the index (i.e., ID that is not None)
+			if structure.id is not None:
+				continue
+
+			# insert the structure itself and get the insertion ID
+			query = 'INSERT INTO structures (id, start, end, type, value) VALUES (?, ?, ?, ?, ?)'
+			cursor.execute(query, structure.serialize())
+			structure.id = int(cursor.lastrowid)
+
+			# gather associated literals
+			structure_literals += [(structure.id, literal.id) for literal in structure.literals]
+
+		# map constituting literals to structures
+		query = 'INSERT INTO structure_literals (structure, literal) VALUES (?, ?)'
+		cursor.executemany(query, structure_literals)
+
+		self.db_connection.commit()
+
+		return structures
+
+	@requires_database
+	def add_hierarchies(self, hierarchies:list[tuple[Structure,Structure]]):
+		cursor = self.db_connection.cursor()
+
+		assert all((parent.id is not None) and (child.id is not None) for parent, child in hierarchies), f"[Error] Please make sure to add all structures to the index before adding the corresponding hierarchies."
+
+		query = 'INSERT INTO hierarchical_structures (parent, child) VALUES (?, ?)'
+		cursor.executemany(query, [(parent.id, child.id) for parent, child in hierarchies])
 
 		self.db_connection.commit()
 
@@ -76,7 +114,7 @@ class DecafIndex:
 		cursor = self.db_connection.cursor()
 
 		for start, end in ranges:
-			query = 'SELECT GROUP_CONCAT(value, "") as export FROM atoms WHERE start >= ? AND end <= ?'
+			query = 'SELECT GROUP_CONCAT(value, "") as export FROM literals WHERE start >= ? AND end <= ?'
 			cursor.execute(query, (start, end))
 			yield cursor.fetchone()[0]
 
@@ -105,7 +143,7 @@ class DecafIndex:
 		# case: output level should be at a specific structural level
 		if output_level is not None:
 			relevant_view = 'relevant_structures'
-			output_columns = 'DISTINCT structure_id, structure_start, structure_end'
+			output_columns = 'structure_id, structure_start, structure_end'
 
 		# case: constraint should be applied within a specific structural level
 		if constraint.level is not None:
@@ -158,22 +196,25 @@ class DecafIndex:
 	def get_size(self):
 		cursor = self.db_connection.cursor()
 
-		cursor.execute('SELECT COUNT(id) FROM atoms')
-		num_atoms = cursor.fetchone()[0]
+		cursor.execute('SELECT COUNT(id) FROM literals')
+		num_literals = cursor.fetchone()[0]
 
 		cursor.execute('SELECT COUNT(id) FROM structures')
 		num_structures = cursor.fetchone()[0]
 
-		return num_atoms, num_structures
+		cursor.execute('SELECT COUNT(parent) FROM hierarchical_structures')
+		num_hierarchies = cursor.fetchone()[0]
+
+		return num_literals, num_structures, num_hierarchies
 
 	@requires_database
-	def get_atom_counts(self):
+	def get_literal_counts(self):
 		cursor = self.db_connection.cursor()
 
-		cursor.execute('SELECT value, COUNT(value) AS total FROM atoms GROUP BY value')
-		atom_counts = {v: c for v, c in cursor.fetchall()}
+		cursor.execute('SELECT value, COUNT(value) AS total FROM literals GROUP BY value')
+		literal_counts = {v: c for v, c in cursor.fetchall()}
 
-		return atom_counts
+		return literal_counts
 
 	@requires_database
 	def get_structure_counts(self):

@@ -56,8 +56,8 @@ def main():
 	)
 
 	with decaf_index as di:
-		num_atoms, num_structures = decaf_index.get_size()
-		print(f"Connected to DECAF index at '{args.index}' with {num_atoms} atom(s) and {num_structures} structure(s).")
+		num_atoms, num_structures, num_hierarchies = decaf_index.get_size()
+		print(f"Connected to DECAF index at '{args.index}' with {num_atoms} atom(s) and {num_structures} structure(s) in {num_hierarchies} hierarchies.")
 
 		print("Constructed SQL query from constraints:")
 		print('```')

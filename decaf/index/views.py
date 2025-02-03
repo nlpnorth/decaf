@@ -36,25 +36,21 @@ def filtered_substructures(constraint, view_prefix=''):
 def relevant_literals(constraint, view_prefix=''):
 	# view containing all potentially relevant substructures (w/ literals for types with literal constraints)
 	view = f'''
-    SELECT
+	SELECT
         substructures.substructure_id AS substructure_id,
         substructures.position AS position, substructures.start AS start, substructures.end AS end,
         {', '.join(f'substructures."type={t}" AS "type={t}"' for t in constraint.get_types())},
-        literal
+        GROUP_CONCAT(literals.value, '') AS literal
     FROM
         {view_prefix}filtered_substructures AS substructures
-    LEFT JOIN (
-        SELECT
-            filtered_substructures.substructure_id AS substructure_id, GROUP_CONCAT(atoms.value, '') AS literal
-        FROM
-            {view_prefix}filtered_substructures AS filtered_substructures
-            JOIN atoms
-            ON (
-                atoms.start >= filtered_substructures.start AND atoms.end <= filtered_substructures.end
-                AND ({constraint.to_sql(literals=False, literals_only=True, column_prefix='filtered_substructures.')})
-            )
-        GROUP BY filtered_substructures.substructure_id) AS literals
-    ON (substructures.substructure_id = literals.substructure_id)'''
+    JOIN
+        structure_literals
+    ON (substructures.substructure_id = structure_literals.structure)
+    JOIN
+        literals
+    ON (structure_literals.literal = literals.id)
+    GROUP BY structure_literals.structure
+	'''
 	return view
 
 
@@ -123,17 +119,22 @@ def relevant_structures(constraint, level, view_prefix):
 
 	# construct view joining matched substructures with containing constraint structures
 	view = f'''
-    SELECT
+	SELECT
         structure_id, structure_start, structure_end, substructure_id, position, start, end,
         {', '.join(f'"type={t}"' for t in constraint.get_types())}
         {', literal' if constraint.has_literals() else ''}
     FROM
-        {filtered_view}
+		{filtered_view}
+    JOIN
+        hierarchical_structures
+    ON (substructure_id = hierarchical_structures.child)
     JOIN (
-        SELECT id AS structure_id, START AS structure_start, END AS structure_end
+        SELECT id AS structure_id, start AS structure_start, end AS structure_end
         FROM structures
-        WHERE TYPE = "{level}"
-    ) ON (START >= structure_start AND END <= structure_end)'''
+        WHERE type = "{level}"
+    ) AS parent_structures
+    ON (parent_structures.structure_id = hierarchical_structures.parent)
+	'''
 
 	return view
 
@@ -146,17 +147,6 @@ def filtered_structures(constraint, view_prefix=''):
     FROM {view_prefix}relevant_structures
     GROUP BY structure_id
     HAVING ({constraint.to_grouped_sql()})'''
-
-	# special case: non-sequential constraint w/o literals (the below query is magnitudes faster for some reason)
-	if (not constraint.has_literals()) and (not constraint.sequential):
-		view = f'''
-	    SELECT DISTINCT
-	        relevant.structure_id AS structure_id, relevant.structure_start, relevant.structure_end
-	    FROM
-	        {view_prefix}relevant_structures AS relevant
-	    JOIN
-	        ({view}) AS filtered
-	    ON (filtered.structure_id = relevant.structure_id)'''
 
 	return view
 

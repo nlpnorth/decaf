@@ -1,6 +1,6 @@
 from typing import Optional
 
-class Atom:
+class Literal:
 	def __init__(self, start:int, end:int, value:str, index_id:Optional[int] = None):
 		self.start = start
 		self.end = end
@@ -8,7 +8,7 @@ class Atom:
 		self.id = index_id
 
 	def __repr__(self):
-		return f'''<Atom (id={self.id}, loc={self.start}-{self.end}): value='{self.value}'>'''
+		return f'''<Literal (id={self.id}, loc={self.start}-{self.end}): value='{self.value}'>'''
 
 	def serialize(self):
 		return self.id, self.start, self.end, self.value

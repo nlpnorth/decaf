@@ -37,7 +37,7 @@ def main():
 		criteria=[
 			Criterion(
 				operation='OR',
-			    conditions=[Condition(stype=t) for t in args.source_types]
+			    conditions=[Condition(stype=t) for t in args.target_types]
 			)
 		],
 		level=args.constraint_level
