@@ -118,6 +118,24 @@ class DecafIndex:
 			cursor.execute(query, (start, end))
 			yield cursor.fetchone()[0]
 
+	@requires_database
+	def export_masked(self, mask_ranges):
+		num_literals, _, _ = self.get_size()
+		mask_ranges += [(None, num_literals, num_literals)]
+
+		cursor = self.db_connection.cursor()
+
+		start = 0
+		for mask_id, mask_start, mask_end in mask_ranges:
+			end = mask_start
+			query = 'SELECT GROUP_CONCAT(value, "") as export FROM literals WHERE start >= ? AND end <= ?'
+			cursor.execute(query, (start, end))
+			output = cursor.fetchone()[0]
+			if output is not None:
+				yield output
+
+			start = mask_end
+
 	#
 	# filtering functions
 	#
@@ -187,6 +205,15 @@ class DecafIndex:
 		)
 		for structure_id, start, end in filter_ranges:
 			yield structure_id, start, end, next(self.export_ranges([(start, end)]))
+
+	@requires_database
+	def mask(self, constraint, mask_level = None):
+		filter_ranges = self.get_filter_ranges(
+			constraint=constraint,
+			output_level=mask_level
+		)
+		for output in self.export_masked(mask_ranges=filter_ranges):
+			yield output
 
 	#
 	# statistics functions
