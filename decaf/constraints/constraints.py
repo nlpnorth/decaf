@@ -1,10 +1,11 @@
 from typing import Optional
 
 class Condition:
-	def __init__(self, stype:str, values:Optional[list[str]]=None, literals:Optional[list[str]]=None, min_count:int=0):
+	def __init__(self, stype:str, values:Optional[list[str]]=None, literals:Optional[list[str]]=None, match:str='=', min_count:int=1):
 		self.type = stype
 		self.values = values if values else None
 		self.literals = literals if literals else None
+		self.match = match
 		self.min_count = min_count
 
 	def get_types(self):
@@ -16,16 +17,16 @@ class Condition:
 	def to_sql(self, literals=True, column_prefix=''):
 		sql = f'{column_prefix}"type={self.type}" IS NOT NULL'
 		if self.values is not None:
-			query_set = '(' + ', '.join(f"'{v}'" for v in self.values) + ')'
-			sql += f' AND {column_prefix}"type={self.type}" IN {query_set}'
+			query_match = ' OR '.join(f"({column_prefix}\"type={self.type}\" {self.match} '{v}')" for v in self.values)
+			sql += f' AND ({query_match})'
 		# add literal if not pre-filtering
 		if literals and (self.literals is not None):
-			query_set = '(' + ', '.join(f"'{l}'" for l in self.literals) + ')'
-			sql += f" AND {column_prefix}literal IN {query_set}"
+			query_match = ' OR '.join(f"({column_prefix}literal {self.match} '{l}')" for l in self.literals)
+			sql += f' AND ({query_match})'
 		return sql
 
 	def to_grouped_sql(self):
-		sql = f'SUM(CASE WHEN ({self.to_sql()}) THEN 1 ELSE 0 END) > {self.min_count}'
+		sql = f'SUM(CASE WHEN ({self.to_sql()}) THEN 1 ELSE 0 END) >= {self.min_count}'
 		return sql
 
 
