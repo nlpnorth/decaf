@@ -10,6 +10,7 @@ from decaf.constraints import Constraint, Criterion, Condition
 def parse_arguments():
 	parser = argparse.ArgumentParser(description="Filtered Index Exporter")
 	parser.add_argument('--index', required=True, help='path to SQLite DECAF index')
+	parser.add_argument('--output', help='path to output file')
 	return parser.parse_args()
 
 
@@ -75,10 +76,21 @@ def main():
 			output_level=output_level
 		)
 
+		# initialize output file pointer (if specified)
+		output_file = None
+		if args.output is not None:
+			output_file = open(args.output, 'w', encoding='utf8')
+
 		num_matches = 0
 		for sid, start, end, export in outputs:
 			print(f"\n[ID {sid} | {start}-{end}] '{export}'")
+			if output_file is not None:
+				output_file.write(export + '\n')
 			num_matches += 1
+
+		if output_file is not None:
+			output_file.close()
+			print(f"Saved {num_matches} outputs to '{args.output}'.")
 
 	print(
 		f"\nCompleted retrieval of {num_matches} match(es) from DECAF index "
