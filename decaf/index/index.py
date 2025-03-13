@@ -1,7 +1,6 @@
 import sqlite3
 
 import pandas as pd
-from pycparser.ply.cpp import literals
 
 from decaf.index import Literal, Structure
 from decaf.index.views import construct_views
@@ -10,15 +9,15 @@ from decaf.index.views import construct_views
 # helper functions
 #
 
-def requires_database(func):
+def requires_connection(func):
 	# wrap function that uses the DB connection
-	def wrapped_func(self, *args, **kwargs):
+	def database_function(self, *args, **kwargs):
 		# check if function is called within an active database connection
 		if self.db_connection is None:
 			raise RuntimeError(f"The {func.__name__} function must be called within an active database connection context.")
 		return func(self, *args, **kwargs)
 
-	return wrapped_func
+	return database_function
 
 
 #
@@ -42,14 +41,28 @@ class DecafIndex:
 
 	def disconnect(self):
 		if self.db_connection is not None:
+			self.commit()
 			self.db_connection.close()
 			self.db_connection = None
+
+	@requires_connection
+	def commit(self):
+		self.db_connection.commit()
 
 	#
 	# import functions
 	#
 
-	@requires_database
+	@requires_connection
+	def add(self, literals:list[Literal], structures:list[Structure], hierarchies:list[tuple[Structure,Structure]]):
+		# insert literals into index (this updates the associated literals' index IDs)
+		self.add_literals(literals=literals)
+		# insert structures into index (associate structures and previously initialized literal IDs)
+		self.add_structures(structures=structures)
+		# insert hierarchies into index (based on previously initialized structure IDs)
+		self.add_hierarchies(hierarchies=hierarchies)
+
+	@requires_connection
 	def add_literals(self, literals:list[Literal]) -> list[Literal]:
 		cursor = self.db_connection.cursor()
 
@@ -62,12 +75,10 @@ class DecafIndex:
 			cursor.execute(query, literal.serialize())
 			literal.id = int(cursor.lastrowid)
 
-		self.db_connection.commit()
-
 		return literals
 
-	@requires_database
-	def add_structures(self, structures:list[Structure]):
+	@requires_connection
+	def add_structures(self, structures:list[Structure]) -> list[Structure]:
 		cursor = self.db_connection.cursor()
 
 		structure_literals = []
@@ -90,11 +101,9 @@ class DecafIndex:
 		query = 'INSERT INTO structure_literals (structure, literal) VALUES (?, ?)'
 		cursor.executemany(query, structure_literals)
 
-		self.db_connection.commit()
-
 		return structures
 
-	@requires_database
+	@requires_connection
 	def add_hierarchies(self, hierarchies:list[tuple[Structure,Structure]]):
 		cursor = self.db_connection.cursor()
 
@@ -103,13 +112,11 @@ class DecafIndex:
 		query = 'INSERT INTO hierarchical_structures (parent, child) VALUES (?, ?)'
 		cursor.executemany(query, [(parent.id, child.id) for parent, child in hierarchies])
 
-		self.db_connection.commit()
-
 	#
 	# export functions
 	#
 
-	@requires_database
+	@requires_connection
 	def export_ranges(self, ranges):
 		cursor = self.db_connection.cursor()
 
@@ -118,7 +125,7 @@ class DecafIndex:
 			cursor.execute(query, (start, end))
 			yield cursor.fetchone()[0]
 
-	@requires_database
+	@requires_connection
 	def export_masked(self, mask_ranges):
 		num_literals, _, _ = self.get_size()
 		mask_ranges += [(None, num_literals, num_literals)]
@@ -178,7 +185,7 @@ class DecafIndex:
 
 		return query
 
-	@requires_database
+	@requires_connection
 	def get_filter_ranges(self, constraint, output_level):
 		cursor = self.db_connection.cursor()
 
@@ -191,7 +198,7 @@ class DecafIndex:
 
 		return cursor.fetchall()
 
-	@requires_database
+	@requires_connection
 	def filter(self, constraint, output_level='structures'):
 		filter_ranges = self.get_filter_ranges(
 			constraint=constraint,
@@ -200,7 +207,7 @@ class DecafIndex:
 		for structure_id, start, end in filter_ranges:
 			yield structure_id, start, end, next(self.export_ranges([(start, end)]))
 
-	@requires_database
+	@requires_connection
 	def mask(self, constraint, mask_level='structures'):
 		filter_ranges = self.get_filter_ranges(
 			constraint=constraint,
@@ -213,7 +220,7 @@ class DecafIndex:
 	# statistics functions
 	#
 
-	@requires_database
+	@requires_connection
 	def get_size(self):
 		cursor = self.db_connection.cursor()
 
@@ -228,7 +235,7 @@ class DecafIndex:
 
 		return num_literals, num_structures, num_hierarchies
 
-	@requires_database
+	@requires_connection
 	def get_literal_counts(self):
 		cursor = self.db_connection.cursor()
 
@@ -237,7 +244,7 @@ class DecafIndex:
 
 		return literal_counts
 
-	@requires_database
+	@requires_connection
 	def get_structure_counts(self):
 		cursor = self.db_connection.cursor()
 
@@ -246,7 +253,7 @@ class DecafIndex:
 
 		return structure_counts
 
-	@requires_database
+	@requires_connection
 	def get_cooccurence(self, source_constraint, target_constraint):
 		# prepare views for easier retrieval
 		source_views = construct_views(constraint=source_constraint, view_prefix='source_')

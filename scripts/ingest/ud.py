@@ -4,8 +4,6 @@ import time
 
 from typing import Optional
 
-from numpy.distutils.lib2def import output_def
-
 from decaf.index import Literal, Structure, DecafIndex
 
 from conllu import TokenList, TokenTree, Token, parse_incr
@@ -33,6 +31,7 @@ def parse_arguments():
 	parser.add_argument('--input', required=True, help='path to UD treebank in CoNLL-U format')
 	parser.add_argument('--output', required=True, help='path to output SQLite index')
 	parser.add_argument('--literal-level', default='character', help='level at which to store atomic literals (default: character)')
+	parser.add_argument('--commit-steps', type=int, help='number of steps after which to perform a backup commit (default: None)')
 	return parser.parse_args()
 
 
@@ -343,6 +342,10 @@ def main():
 	print(f"Connected to DECAF index at '{args.output}'.")
 
 	print(f"Loading UD treebank from '{args.input}'...")
+	# get total number of sentences
+	with open(args.input) as fp:
+		num_sentences = sum(1 for line in fp if line.startswith('1\t'))
+	# ingest sentences into DECAF index
 	with open(args.input) as fp, decaf_index as di:
 		num_literals, num_structures, num_hierarchies = di.get_size()
 		cursor_idx = 0  # initialize character-level dataset cursor
@@ -353,7 +356,7 @@ def main():
 		# iterate over sentences
 		start_time = time.time()
 		for sentence_idx, sentence in enumerate(parse_incr(fp)):
-			print(f"\x1b[1K\r[{sentence_idx + 1}] Building index...", end='', flush=True)
+			print(f"\x1b[1K\r[{sentence_idx + 1}/{num_sentences} | {(sentence_idx + 1)/num_sentences:.2%}] Building index...", end='', flush=True)
 			cur_literals, cur_structures, cur_hierarchies, cur_carryover = parse_sentence(
 				sentence, cursor_idx,
 				literal_level=args.literal_level
@@ -375,12 +378,13 @@ def main():
 				cur_structures += new_structures
 				cur_hierarchies += new_hierarchies
 
-			# insert sentence-level literals into index (this updates the associated literals' index IDs)
-			di.add_literals(literals=cur_literals)
-			# insert sentence-level structures into index (associate structures and previously initialized literal IDs)
-			di.add_structures(structures=cur_structures)
-			# insert sentence-level hierarchies into index
-			di.add_hierarchies(hierarchies=cur_hierarchies)
+			# insert sentence-level literals, structures, and hierarchies into index
+			di.add(literals=cur_literals, structures=cur_structures, hierarchies=cur_hierarchies)
+
+			# perform backup commit
+			if (args.commit_steps is not None) and (sentence_idx%args.commit_steps == 0):
+				di.commit()
+				print(f"\nPerformed backup commit to index at '{args.output}'.")
 
 			cursor_idx += len(cur_literals)  # increment character-level cursor by number of atoms (i.e., characters)
 
@@ -391,8 +395,7 @@ def main():
 			carryover_sentences, None,
 			cursor_idx
 		)
-		di.add_structures(structures=new_structures)
-		di.add_hierarchies(hierarchies=new_hierarchies)
+		di.add(literals=[], structures=new_structures, hierarchies=new_hierarchies)
 
 		# compute number of added structures
 		new_num_literals, new_num_structures, new_num_hierarchies = di.get_size()
@@ -400,8 +403,8 @@ def main():
 			f"\x1b[1K\rBuilt index with {new_num_literals - num_literals} literals "
 			f"and {new_num_structures - num_structures} structures "
 			f"with {new_num_hierarchies - num_hierarchies} hierarchical relations "
-			f"for {sentence_idx + 1} sentences "
-			f"from '{args.input}'"
+			f"for {num_sentences} sentences "
+			f"from '{args.input}' "
 			f"in {time.time() - start_time:.2f}s.")
 
 		# print statistics
