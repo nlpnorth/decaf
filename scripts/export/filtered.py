@@ -23,15 +23,12 @@ def main():
 	# connect to DECAF index
 	decaf_index = DecafIndex(db_path=args.index)
 
-	# construct criterion
-	output_level = 'sentence'
-	# match structures of type "upos" with values "ADJ" or "NOUN"
-	# constraint = Criterion(
-	# 	conditions=[
-	# 		Condition(stype='upos', values=['ADJ', 'NOUN'])
-	# 	]
-	# )
-	# match structures of type "upos" with values "ADJ" with literal "second" and "NOUN"
+	# construct criterion:
+	# sentences containing tokens containing annotations matching
+	# upos='DET' and surface form 'the
+	# upos='ADJ'
+	# upos='NOUN' and Number='Plur'
+	# occurring in a sequence
 	constraint = Constraint(
 		criteria=[
 			Criterion(
@@ -52,9 +49,10 @@ def main():
 				]
 			)
 		],
-		level='sentence',
-		sequential=True
+		sequential=True,
+		hierarchy=['sentence', 'token']
 	)
+	output_level = 'structures'
 
 	with decaf_index as di:
 		num_atoms, num_structures, num_hierarchies = decaf_index.get_size()
@@ -71,10 +69,7 @@ def main():
 		print("Querying index...")
 		query_start_time = time.time()
 
-		outputs = di.filter(
-			constraint=constraint,
-			output_level=output_level
-		)
+		outputs = di.filter(constraint=constraint, output_level=output_level)
 
 		# initialize output file pointer (if specified)
 		output_file = None

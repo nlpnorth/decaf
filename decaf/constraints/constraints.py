@@ -71,10 +71,10 @@ class Criterion:
 
 
 class Constraint:
-	def __init__(self, criteria: list[Criterion], level: Optional[str]=None, sequential:bool=False):
+	def __init__(self, criteria:list[Criterion], sequential:bool=False, hierarchy:Optional[list[str]]=None):
 		self.criteria = criteria
-		self.level = level
 		self.sequential = sequential
+		self.hierarchy = hierarchy
 
 	def has_literals(self):
 		return any(c.has_literals() for c in self.criteria)

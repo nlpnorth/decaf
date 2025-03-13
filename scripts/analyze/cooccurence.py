@@ -9,8 +9,9 @@ def parse_arguments():
 	parser = argparse.ArgumentParser(description="DECAF Annotation Co-occurrence Analysis")
 	parser.add_argument('--index', required=True, help='path to SQLite DECAF index')
 	parser.add_argument('--source-types', nargs='+', help='list of source annotation types')
+	parser.add_argument('--source-hierarchy', nargs='+', help='hierarchy within which to apply source constraints')
 	parser.add_argument('--target-types', nargs='+', help='list of target annotation types')
-	parser.add_argument('--constraint-level', help='level at which to apply constraints')
+	parser.add_argument('--target-hierarchy', nargs='+', help='hierarchy within which to apply target constraints')
 	return parser.parse_args()
 
 
@@ -31,7 +32,7 @@ def main():
 			    conditions=[Condition(stype=t) for t in args.source_types]
 			)
 		],
-		level=args.constraint_level
+		hierarchy=args.source_hierarchy
 	)
 	target_constraint = Constraint(
 		criteria=[
@@ -40,7 +41,7 @@ def main():
 			    conditions=[Condition(stype=t) for t in args.target_types]
 			)
 		],
-		level=args.constraint_level
+		hierarchy=args.target_hierarchy
 	)
 
 	with decaf_index as di:

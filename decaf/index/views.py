@@ -107,8 +107,9 @@ def filtered_sequences(constraint, view_prefix=''):
 
 # structural constraints
 
-def relevant_structures(constraint, level, view_prefix):
+def relevant_structures(constraint, view_prefix):
 	# view over potentially relevant parent constraint structures
+	assert constraint.hierarchy is not None, f"[Error] Cannot construct view of parent structures if no hierarchy is provided."
 
 	# select the relevant filtered view (default: non-sequential structures w/o literals)
 	filtered_view = f'{view_prefix}filtered_substructures'
@@ -117,6 +118,24 @@ def relevant_structures(constraint, level, view_prefix):
 	if constraint.sequential:
 		filtered_view = f'{view_prefix}filtered_sequences'
 
+	# construct joins across specified hierarchy
+	joins = []
+	subsumed_id = 'substructure_id'
+	for level_idx, level in enumerate(reversed(constraint.hierarchy)):
+		is_root = (level_idx == len(constraint.hierarchy) - 1)
+		level_id = 'structure_id' if is_root else f'level{level_idx}_id'
+		joins.append(f'''
+			JOIN
+		        hierarchical_structures AS hs{level_idx}
+		    JOIN (
+		        SELECT id AS {level_id}{', start AS structure_start, end AS structure_end' if is_root else ''}
+		        FROM structures
+		        WHERE type = "{level}"
+		    )
+		    ON ({level_id} = hs{level_idx}.parent AND {subsumed_id} = hs{level_idx}.child)
+			''')
+		subsumed_id = str(level_id)
+
 	# construct view joining matched substructures with containing constraint structures
 	view = f'''
 	SELECT
@@ -124,17 +143,7 @@ def relevant_structures(constraint, level, view_prefix):
         {', '.join(f'"type={t}"' for t in constraint.get_types())}
         {', literal' if constraint.has_literals() else ''}
     FROM
-		{filtered_view}
-    JOIN
-        hierarchical_structures
-    ON (substructure_id = hierarchical_structures.child)
-    JOIN (
-        SELECT id AS structure_id, start AS structure_start, end AS structure_end
-        FROM structures
-        WHERE type = "{level}"
-    ) AS parent_structures
-    ON (parent_structures.structure_id = hierarchical_structures.parent)
-	'''
+		{filtered_view}\n''' + '\n'.join(joins)
 
 	return view
 
@@ -170,7 +179,7 @@ def filtered_constrained_substructures(constraint, view_prefix=''):
 
 # all conjoined views
 
-def construct_views(constraint, output_level=None, view_prefix=''):
+def construct_views(constraint, view_prefix=''):
 	views = {}
 
 	# substructure-level views (w/o literals)
@@ -184,12 +193,9 @@ def construct_views(constraint, output_level=None, view_prefix=''):
 	if constraint.sequential:
 		views['filtered_sequences_pivot'] = filtered_sequences_pivot(constraint=constraint, view_prefix=view_prefix)
 		views['filtered_sequences'] = filtered_sequences(constraint=constraint, view_prefix=view_prefix)
-	# parent structure-level views (w/ or w/o literals)
-	if output_level is not None:
-		views['relevant_structures'] = relevant_structures(constraint=constraint, level=output_level, view_prefix=view_prefix)
 	# substructures constrained within parent structure-level (w/ or w/o literals)
-	if constraint.level is not None:
-		views['relevant_structures'] = relevant_structures(constraint=constraint, level=constraint.level, view_prefix=view_prefix)
+	if constraint.hierarchy is not None:
+		views['relevant_structures'] = relevant_structures(constraint=constraint, view_prefix=view_prefix)
 		views['filtered_structures'] = filtered_structures(constraint=constraint, view_prefix=view_prefix)
 		views['filtered_constrained_substructures'] = filtered_constrained_substructures(constraint=constraint, view_prefix=view_prefix)
 

@@ -144,7 +144,7 @@ class DecafIndex:
 		#
 		# SQL Query Construction Logic
 		#
-		views = construct_views(constraint=constraint, output_level=output_level)
+		views = construct_views(constraint=constraint)
 
 		# case: substructures w/o structural constraint (w/o literals)
 		relevant_view = 'filtered_substructures'
@@ -158,27 +158,21 @@ class DecafIndex:
 		if constraint.sequential:
 			relevant_view = 'filtered_sequences'
 
-		# case: output level should be at a specific structural level
-		if output_level is not None:
-			relevant_view = 'relevant_structures'
-			output_columns = 'structure_id, structure_start, structure_end'
-
 		# case: constraint should be applied within a specific structural level
-		if constraint.level is not None:
+		if constraint.hierarchy is not None:
 
 			# case: output should be at the level of the matching substructures
-			if output_level is None:
+			if output_level == 'substructures':
 				relevant_view = 'filtered_constrained_substructures'
 
 			# case: output should be at the level of the constraining parent structures
-			elif (output_level is not None) and (output_level == constraint.level):
+			elif output_level == 'structures':
 				relevant_view = 'filtered_structures'
 				output_columns = 'structure_id, structure_start, structure_end'
 
 			# case: output level does not match the constraint level
 			else:
-				raise NotImplementedError(
-					f"For structurally constrained queries, output levels besides the constraint or match level are unsupported. Specified output level: '{output_level}'.")
+				raise NotImplementedError(f"Unsupported output level '{output_level}'.")
 
 		query = views + f'SELECT {output_columns} FROM {relevant_view}'
 
@@ -198,7 +192,7 @@ class DecafIndex:
 		return cursor.fetchall()
 
 	@requires_database
-	def filter(self, constraint, output_level = None):
+	def filter(self, constraint, output_level='structures'):
 		filter_ranges = self.get_filter_ranges(
 			constraint=constraint,
 			output_level=output_level
@@ -207,7 +201,7 @@ class DecafIndex:
 			yield structure_id, start, end, next(self.export_ranges([(start, end)]))
 
 	@requires_database
-	def mask(self, constraint, mask_level = None):
+	def mask(self, constraint, mask_level='structures'):
 		filter_ranges = self.get_filter_ranges(
 			constraint=constraint,
 			output_level=mask_level
@@ -254,8 +248,6 @@ class DecafIndex:
 
 	@requires_database
 	def get_cooccurence(self, source_constraint, target_constraint):
-		assert source_constraint.level == target_constraint.level, f"[Error] Source and target constraints must be applied at the same structural level: {source_constraint.level} ≠ {target_constraint.level}."
-
 		# prepare views for easier retrieval
 		source_views = construct_views(constraint=source_constraint, view_prefix='source_')
 		target_views = construct_views(constraint=target_constraint, view_prefix='target_')
@@ -264,7 +256,7 @@ class DecafIndex:
 		relevant_view = 'filtered_substructures'  # default: relevant structures without constraint
 		join_criterion = 'srv.start = trv.start AND srv.end = trv.end'  # default: structures occurring at matching positions
 
-		if (source_constraint.level is not None) and (target_constraint.level is not None):
+		if (source_constraint.hierarchy is not None) and (target_constraint.hierarchy is not None):
 			relevant_view = 'filtered_constrained_substructures'
 			join_criterion = 'srv.structure_id = trv.structure_id'  # match at the level of parent structures (e.g., sentences)
 

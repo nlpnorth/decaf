@@ -4,6 +4,8 @@ import time
 
 from typing import Optional
 
+from numpy.distutils.lib2def import output_def
+
 from decaf.index import Literal, Structure, DecafIndex
 
 from conllu import TokenList, TokenTree, Token, parse_incr
@@ -119,22 +121,22 @@ def parse_token(token:Token, cursor_idx:int, literal_level:str, trailing_space:O
 	return literals, structures, hierarchies
 
 
-def parse_dependencies(tree:TokenTree, token_structures:dict[int, list[Structure]]):
+def parse_dependencies(tree:TokenTree, token_structures:dict[int, Structure]):
 	structures, hierarchies = [], []
 
 	relation = tree.token['deprel']
 	token_id = tree.token['id']
-	literals = token_structures[token_id][0].literals
-	start_idx, end_idx = token_structures[token_id][0].start, token_structures[token_id][0].end
+	literals = token_structures[token_id].literals
+	start_idx, end_idx = token_structures[token_id].start, token_structures[token_id].end
 
 	# recursively process child nodes
 	for child in tree.children:
 		child_structures, child_hierarchies = parse_dependencies(tree=child, token_structures=token_structures)
 		structures += child_structures
 		hierarchies += child_hierarchies
-		literals += token_structures[child.token['id']][0].literals
-		start_idx = min(start_idx, token_structures[child.token['id']][0].start)
-		end_idx = max(end_idx, token_structures[child.token['id']][0].end)
+		literals += token_structures[child.token['id']].literals
+		start_idx = min(start_idx, token_structures[child.token['id']].start)
+		end_idx = max(end_idx, token_structures[child.token['id']].end)
 
 	# append parent structure
 	dependency = Structure(
@@ -144,8 +146,7 @@ def parse_dependencies(tree:TokenTree, token_structures:dict[int, list[Structure
 	)
 	hierarchies += \
 		[(dependency, child) for child in structures] + \
-		[(dependency, grandchild) for _, grandchild in hierarchies] + \
-		[(dependency, child) for child in token_structures[token_id]]
+		[(dependency, token_structures[token_id])]
 	structures.append(dependency)
 
 	return structures, hierarchies
@@ -157,7 +158,7 @@ def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str) -> tup
 
 	# parse tokens in sentence
 	token_cursor_idx = int(cursor_idx)
-	token_structures_by_id = {}
+	tokens_by_id = {}
 	multitoken_end = None
 	multitoken_space = None
 	for token_idx, token in enumerate(sentence):
@@ -184,16 +185,16 @@ def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str) -> tup
 		literals += token_literals
 		structures += token_structures
 		hierarchies += token_hierarchies
-		token_structures_by_id[token['id']] = token_structures
+		tokens_by_id[token['id']] = token_structures[0]
 		token_cursor_idx += len(token_literals)
 
 	# create hierarchical dependency structures
 	dependency_structures, dependency_hierarchies = parse_dependencies(
 		tree=sentence.to_tree(),
-		token_structures=token_structures_by_id
+		token_structures=tokens_by_id
 	)
-	structures += dependency_structures
-	hierarchies += dependency_hierarchies
+	structures = dependency_structures + structures
+	hierarchies = dependency_hierarchies + hierarchies
 
 	# create structures from UD's sentence-level annotations
 	start_idx, end_idx = cursor_idx, token_cursor_idx
@@ -225,12 +226,11 @@ def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str) -> tup
 
 	# establish sentence-level hierarchies
 	hierarchies += \
-			[(sentence_structure, child) for child in structures] + \
-			[(sentence_structure, grandchild) for _, grandchild in hierarchies] + \
-			[(sentence_structure, sibling) for sibling in sentence_structures[1:]]
+			[(sentence_structure, token) for token in tokens_by_id.values()] + \
+			[(sentence_structure, dependency) for dependency in dependency_structures] + \
+			[(sentence_structure, sentence_annotation) for sentence_annotation in sentence_structures[1:]]
 
-	structures += sentence_structures
-	hierarchies = list(set(hierarchies))  # remove redundant hierarchies (e.g., from sentence and dependency level)
+	structures = sentence_structures + structures
 
 	return literals, structures, hierarchies, carryover
 
@@ -238,88 +238,94 @@ def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str) -> tup
 def parse_carryover(
 		carryover:dict, next_carryover:dict,
 		literals:dict[str, list[Literal]], next_literals:list[Literal],
-		carryover_hierarchies:dict[str, list[tuple[Structure,Structure]]], next_hierarchies:list[tuple[Structure,Structure]],
+		sentences:dict[str, list[Structure]], next_sentence:Structure,
 		cursor_idx:int
-) -> tuple[dict, list[Structure], dict[str, list[Literal]], dict[str, list[tuple[Structure,Structure]]], list[tuple[Structure,Structure]]]:
-	structures = []
+) -> tuple[dict, dict[str, list[Literal]], dict[str, list[Structure]], list[Structure], list[tuple[Structure,Structure]]]:
+	output_structures = []
 	output_hierarchies = []
 
 	# check if paragraph (or document) changed
 	if ('paragraph' in next_carryover) or ('document' in next_carryover):
-		paragraph_id, paragraph_start_idx = carryover['paragraph']
-		structures.append(
-			Structure(
-				start=paragraph_start_idx, end=cursor_idx,
-				value=None, stype='paragraph',
-				literals=literals['paragraph']
-			)
-		)
-
-		if paragraph_id:
-			structures.append(
-				Structure(
+		# store previous paragraph information
+		if 'paragraph' in carryover:
+			paragraph_id, paragraph_start_idx = carryover['paragraph']
+			paragraph = Structure(
 					start=paragraph_start_idx, end=cursor_idx,
-					value=paragraph_id, stype='paragraph_id',
+					value=None, stype='paragraph',
 					literals=literals['paragraph']
 				)
-			)
+			output_structures.append(paragraph)
 
-		# add hierarchical structures at parameter-level
-		for co_structure in structures:
-			output_hierarchies += [(co_structure, child) for _, child in carryover_hierarchies['paragraph']]
+			if paragraph_id:
+				output_structures.append(
+					Structure(
+						start=paragraph_start_idx, end=cursor_idx,
+						value=paragraph_id, stype='paragraph_id',
+						literals=literals['paragraph']
+					)
+				)
+
+			# add hierarchical structures at paragraph-level
+			output_hierarchies += [
+				(paragraph, sentence_structure)
+				for sentence_structure in sentences['paragraph']
+			]
 
 		# reset parameter-level carryover
 		next_carryover['paragraph'] = next_carryover.get('paragraph', (None, cursor_idx))
 		literals['paragraph'] = []
-		carryover_hierarchies['paragraph'] = []
+		sentences['paragraph'] = []
 
 	# check if document changed
 	if 'document' in next_carryover:
 		document = None
-		document_structures = []
 		# create document-level structures and flush metadata
 		for co_field, (co_value, co_start) in carryover.items():
 			# create separate document and document ID structures
 			if co_field == 'document':
-				structures.append(
-					Structure(
+				document =Structure(
 						start=co_start, end=cursor_idx,
 						value=None, stype='document',
 						literals=literals['document']
 					)
-				)
 				co_field = 'document_id'
-				document = structures[-1]
 
 			# skip re-processing of paragraph metadata
 			if co_field == 'paragraph':
 				continue
 
 			# add remaining document-level metadata
-			structures.append(
+			output_structures.append(
 				Structure(
 					start=co_start, end=cursor_idx,
 					value=co_value, stype=co_field,
 					literals=literals['document']
 				)
 			)
-			document_structures.append(structures[-1])
 
 		# add document-level hierarchical structures
 		if document is not None:
-			output_hierarchies += [(document, child) for _, child in carryover_hierarchies['document']]
-			output_hierarchies += [(document, child) for child in document_structures]
+			output_hierarchies += [
+				(document, document_structure)
+				for document_structure in output_structures
+			]
+			output_hierarchies += [
+				(document, sentence_structure)
+				for sentence_structure in sentences['document']
+			]
+			# add document to output structures
+			output_structures = [document] + output_structures
 
 		# reset all carryover data
 		carryover = next_carryover
 		literals = {s:[] for s in literals}
-		carryover_hierarchies = {s:[] for s in carryover_hierarchies}
+		sentences = {s:[] for s in sentences}
 
 	literals = {s: v + next_literals for s, v in literals.items()}
-	carryover_hierarchies = {s: v + next_hierarchies for s, v in carryover_hierarchies.items()}
-	output_hierarchies = list(set(output_hierarchies))  # remove redundant hierarchies
+	sentences = {s: v + [next_sentence] for s, v in sentences.items()}
+	# output_hierarchies = list(set(output_hierarchies))  # remove redundant hierarchies
 
-	return carryover, structures, literals, carryover_hierarchies, output_hierarchies
+	return carryover, literals, sentences, output_structures, output_hierarchies
 
 
 #
@@ -342,7 +348,7 @@ def main():
 		cursor_idx = 0  # initialize character-level dataset cursor
 		carryover = {}  # initialize cross-sentence carryover metadata (e.g., document/paragraph info)
 		carryover_literals = {s:[] for s in METADATA_CARRYOVER.values() if s is not None}  # initialize cross-sentence carryover literals for paragraphs and documents
-		carryover_hierarchies = {s:[] for s in METADATA_CARRYOVER.values() if s is not None}  # initialize cross-sentence carryover hierarchies
+		carryover_sentences = {s:[] for s in METADATA_CARRYOVER.values() if s is not None}  # initialize carryover sentences for paragraphs and documents
 
 		# iterate over sentences
 		start_time = time.time()
@@ -352,17 +358,18 @@ def main():
 				sentence, cursor_idx,
 				literal_level=args.literal_level
 			)
+			cur_sentence = cur_structures[0]
 
 			# process carryover metadata
 			if sentence_idx == 0:
 				carryover = cur_carryover  # first carryover metadata is always retained
 				carryover_literals = {s:cur_literals for s in carryover_literals}
-				carryover_hierarchies = {s:cur_hierarchies for s in carryover_hierarchies}
+				carryover_sentences = {s:[cur_sentence] for s in carryover_sentences}
 			else:
-				carryover, new_structures, carryover_literals, carryover_hierarchies, new_hierarchies  = parse_carryover(
+				carryover, carryover_literals, carryover_sentences, new_structures, new_hierarchies  = parse_carryover(
 					carryover, cur_carryover,
 					carryover_literals, cur_literals,
-					carryover_hierarchies, cur_hierarchies,
+					carryover_sentences, cur_sentence,
 					cursor_idx
 				)
 				cur_structures += new_structures
@@ -378,10 +385,10 @@ def main():
 			cursor_idx += len(cur_literals)  # increment character-level cursor by number of atoms (i.e., characters)
 
 		# process final carryover structures
-		_, new_structures, _, _, new_hierarchies = parse_carryover(
+		_, _, _, new_structures, new_hierarchies = parse_carryover(
 			carryover, {'document': ('end', -1), 'paragraph': ('end', -1)},
 			carryover_literals, [],
-			carryover_hierarchies, [],
+			carryover_sentences, None,
 			cursor_idx
 		)
 		di.add_structures(structures=new_structures)
