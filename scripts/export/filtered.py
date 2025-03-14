@@ -21,7 +21,7 @@ def main():
 	print("="*33)
 
 	# connect to DECAF index
-	decaf_index = DecafIndex(db_path=args.index)
+	decaf_index = DecafIndex(index_path=args.index)
 
 	# construct criterion:
 	# sentences containing tokens containing annotations matching

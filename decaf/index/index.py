@@ -1,9 +1,13 @@
+import os
 import sqlite3
+
+from importlib import resources
 
 import pandas as pd
 
 from decaf.index import Literal, Structure
 from decaf.index.views import construct_views
+
 
 #
 # helper functions
@@ -13,7 +17,7 @@ def requires_connection(func):
 	# wrap function that uses the DB connection
 	def database_function(self, *args, **kwargs):
 		# check if function is called within an active database connection
-		if self.db_connection is None:
+		if self.connection is None:
 			raise RuntimeError(f"The {func.__name__} function must be called within an active database connection context.")
 		return func(self, *args, **kwargs)
 
@@ -25,9 +29,14 @@ def requires_connection(func):
 #
 
 class DecafIndex:
-	def __init__(self, db_path):
-		self.db_path = db_path
-		self.db_connection = None
+	def __init__(self, index_path):
+		self.index_path = index_path
+		self.shards = DecafIndex.load_shards(self.index_path)
+		self.connection = None
+		self.connected_shard = None
+
+	def __repr__(self):
+		return f'''<DecafIndex: {len(self.shards)} shard(s), {'dis' if self.connection is None else ''}connected>'''
 
 	def __enter__(self):
 		self.connect()
@@ -36,35 +45,88 @@ class DecafIndex:
 	def __exit__(self, exception_type, exception_value, exception_traceback):
 		self.disconnect()
 
-	def connect(self):
-		self.db_connection =  sqlite3.connect(self.db_path)
+	def initialize(self):
+		if len(self.shards) < 1:
+			self.add_shard()
+
+	#
+	# database communication
+	#
+
+	def connect(self, shard=0):
+		self.connection =  sqlite3.connect(self.shards[shard])
+		self.connected_shard = shard
+		return self.connection
 
 	def disconnect(self):
-		if self.db_connection is not None:
+		if self.connection is not None:
 			self.commit()
-			self.db_connection.close()
-			self.db_connection = None
+			self.connection.close()
+			self.connection = None
+			self.connected_shard = None
+
+	def connections(self):
+		for shard_idx in range(len(self.shards)):
+			self.disconnect()
+			yield self.connect(shard=shard_idx)
+		self.disconnect()
 
 	@requires_connection
 	def commit(self):
-		self.db_connection.commit()
+		self.connection.commit()
+
+	#
+	# sharding
+	#
+
+	@staticmethod
+	def load_shards(index_path):
+		shards = []
+		shard_file = os.path.join(index_path, f'shard-{len(shards)}.decaf')
+		while os.path.exists(shard_file):
+			shards.append(shard_file)
+			shard_file = os.path.join(index_path, f'shard-{len(shards)}.decaf')
+		return shards
+
+	def add_shard(self):
+		# disconnect from previous shard
+		self.disconnect()
+		# check if index directory exists
+		if not os.path.exists(self.index_path):
+			os.mkdir(self.index_path)
+		# create new database file
+		shard_idx = len(self.shards)
+		shard_file = os.path.join(self.index_path, f'shard-{shard_idx}.decaf')
+		self.shards.append(shard_file)
+		# connect to new shard
+		self.connect(shard=shard_idx)
+		# initialize shard from default schema
+		cursor = self.connection.cursor()
+		with resources.open_text('decaf.config', 'schema.sql') as fp:
+			schema = fp.read()
+		cursor.executescript(schema)
+		self.commit()
 
 	#
 	# import functions
 	#
 
-	@requires_connection
 	def add(self, literals:list[Literal], structures:list[Structure], hierarchies:list[tuple[Structure,Structure]]):
+		# connect to last shard
+		if (self.connection is None) or (self.connected_shard != len(self.shards) - 1):
+			assert len(self.shards) > 0, "[Error] Cannot write to index without shards."
+			self.connect(shard=len(self.shards)-1)
+
 		# insert literals into index (this updates the associated literals' index IDs)
-		self.add_literals(literals=literals)
+		self._add_literals(literals=literals)
 		# insert structures into index (associate structures and previously initialized literal IDs)
-		self.add_structures(structures=structures)
+		self._add_structures(structures=structures)
 		# insert hierarchies into index (based on previously initialized structure IDs)
-		self.add_hierarchies(hierarchies=hierarchies)
+		self._add_hierarchies(hierarchies=hierarchies)
 
 	@requires_connection
-	def add_literals(self, literals:list[Literal]) -> list[Literal]:
-		cursor = self.db_connection.cursor()
+	def _add_literals(self, literals:list[Literal]) -> list[Literal]:
+		cursor = self.connection.cursor()
 
 		for literal in literals:
 			# skip literals which already have an entry in the index (i.e., ID that is not None)
@@ -78,8 +140,8 @@ class DecafIndex:
 		return literals
 
 	@requires_connection
-	def add_structures(self, structures:list[Structure]) -> list[Structure]:
-		cursor = self.db_connection.cursor()
+	def _add_structures(self, structures:list[Structure]) -> list[Structure]:
+		cursor = self.connection.cursor()
 
 		structure_literals = []
 		for structure in structures:
@@ -104,8 +166,8 @@ class DecafIndex:
 		return structures
 
 	@requires_connection
-	def add_hierarchies(self, hierarchies:list[tuple[Structure,Structure]]):
-		cursor = self.db_connection.cursor()
+	def _add_hierarchies(self, hierarchies:list[tuple[Structure,Structure]]):
+		cursor = self.connection.cursor()
 
 		assert all((parent.id is not None) and (child.id is not None) for parent, child in hierarchies), f"[Error] Please make sure to add all structures to the index before adding the corresponding hierarchies."
 
@@ -118,7 +180,7 @@ class DecafIndex:
 
 	@requires_connection
 	def export_ranges(self, ranges):
-		cursor = self.db_connection.cursor()
+		cursor = self.connection.cursor()
 
 		for start, end in ranges:
 			query = 'SELECT GROUP_CONCAT(value, "") as export FROM literals WHERE start >= ? AND end <= ?'
@@ -130,7 +192,7 @@ class DecafIndex:
 		num_literals, _, _ = self.get_size()
 		mask_ranges += [(None, num_literals, num_literals)]
 
-		cursor = self.db_connection.cursor()
+		cursor = self.connection.cursor()
 
 		start = 0
 		for mask_id, mask_start, mask_end in mask_ranges:
@@ -187,7 +249,7 @@ class DecafIndex:
 
 	@requires_connection
 	def get_filter_ranges(self, constraint, output_level):
-		cursor = self.db_connection.cursor()
+		cursor = self.connection.cursor()
 
 		# execute constructed query
 		query = self._construct_filter_query(
@@ -198,63 +260,70 @@ class DecafIndex:
 
 		return cursor.fetchall()
 
-	@requires_connection
 	def filter(self, constraint, output_level='structures'):
-		filter_ranges = self.get_filter_ranges(
-			constraint=constraint,
-			output_level=output_level
-		)
-		for structure_id, start, end in filter_ranges:
-			yield structure_id, start, end, next(self.export_ranges([(start, end)]))
+		for shard_idx, connection in enumerate(self.connections()):
+			filter_ranges = self.get_filter_ranges(
+				constraint=constraint,
+				output_level=output_level
+			)
+			for structure_id, start, end in filter_ranges:
+				yield (shard_idx, structure_id), start, end, next(self.export_ranges([(start, end)]))
 
-	@requires_connection
 	def mask(self, constraint, mask_level='structures'):
-		filter_ranges = self.get_filter_ranges(
-			constraint=constraint,
-			output_level=mask_level
-		)
-		for output in self.export_masked(mask_ranges=filter_ranges):
-			yield output
+		for connection in self.connections():
+			filter_ranges = self.get_filter_ranges(
+				constraint=constraint,
+				output_level=mask_level
+			)
+			for output in self.export_masked(mask_ranges=filter_ranges):
+				yield output
 
 	#
 	# statistics functions
 	#
 
-	@requires_connection
 	def get_size(self):
-		cursor = self.db_connection.cursor()
+		num_literals, num_structures, num_hierarchies = 0, 0, 0
 
-		cursor.execute('SELECT COUNT(id) FROM literals')
-		num_literals = cursor.fetchone()[0]
+		for connection in self.connections():
+			cursor = connection.cursor()
 
-		cursor.execute('SELECT COUNT(id) FROM structures')
-		num_structures = cursor.fetchone()[0]
+			cursor.execute('SELECT COUNT(id) FROM literals')
+			num_literals += cursor.fetchone()[0]
 
-		cursor.execute('SELECT COUNT(parent) FROM hierarchical_structures')
-		num_hierarchies = cursor.fetchone()[0]
+			cursor.execute('SELECT COUNT(id) FROM structures')
+			num_structures += cursor.fetchone()[0]
+
+			cursor.execute('SELECT COUNT(parent) FROM hierarchical_structures')
+			num_hierarchies += cursor.fetchone()[0]
 
 		return num_literals, num_structures, num_hierarchies
 
-	@requires_connection
 	def get_literal_counts(self):
-		cursor = self.db_connection.cursor()
+		literal_counts = {}
 
-		cursor.execute('SELECT value, COUNT(value) AS total FROM literals GROUP BY value')
-		literal_counts = {v: c for v, c in cursor.fetchall()}
+		for connection in self.connections():
+			cursor = connection.cursor()
+			cursor.execute('SELECT value, COUNT(value) AS total FROM literals GROUP BY value')
+			for literal, count in cursor.fetchall():
+				literal_counts[literal] = literal_counts.get(literal, 0) + count
 
 		return literal_counts
 
-	@requires_connection
 	def get_structure_counts(self):
-		cursor = self.db_connection.cursor()
+		structure_counts = {}
 
-		cursor.execute('SELECT type, COUNT(type) AS total FROM structures GROUP BY type')
-		structure_counts = {t: c for t, c in cursor.fetchall()}
+		for connection in self.connections():
+			cursor = connection.cursor()
+			cursor.execute('SELECT type, COUNT(type) AS total FROM structures GROUP BY type')
+			for structure, count in cursor.fetchall():
+				structure_counts[structure] = structure_counts.get(structure, 0) + count
 
 		return structure_counts
 
-	@requires_connection
 	def get_cooccurence(self, source_constraint, target_constraint):
+		cooccurrence = pd.DataFrame(dtype=int)
+
 		# prepare views for easier retrieval
 		source_views = construct_views(constraint=source_constraint, view_prefix='source_')
 		target_views = construct_views(constraint=target_constraint, view_prefix='target_')
@@ -285,14 +354,21 @@ class DecafIndex:
 			{', '.join(f'trv."type={t}"' for t in target_constraint.get_types())}
 		'''
 		query = source_views + ', ' + target_views[5:] + query
-		cooccurrence = pd.read_sql_query(query, self.db_connection)
 
-		# pivot co-occurrence rows to become a matrix
-		cooccurrence = cooccurrence.pivot(
-		    index='sources',
-		    columns='targets',
-		    values='frequency'
-		).fillna(0)
+		# iterate over shards
+		for connection in self.connections():
+			shard_co = pd.read_sql_query(query, connection)
+
+			# pivot co-occurrence rows to become a matrix
+			shard_co = shard_co.pivot(
+			    index='sources',
+			    columns='targets',
+			    values='frequency'
+			).fillna(0)
+
+			# merge across shards
+			shard_co = shard_co.reindex(columns=set().union(cooccurrence.columns, shard_co.columns), fill_value=0)  # fill in missing columns
+			cooccurrence = cooccurrence.add(shard_co, fill_value=0)
+
 		cooccurrence = cooccurrence.astype(int)
-
 		return cooccurrence

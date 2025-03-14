@@ -22,7 +22,7 @@ def main():
 	print("="*43)
 
 	# connect to DECAF index
-	decaf_index = DecafIndex(db_path=args.index)
+	decaf_index = DecafIndex(index_path=args.index)
 
 	# set up types to compute co-occurrence for
 	source_constraint = Constraint(

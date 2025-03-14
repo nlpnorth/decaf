@@ -29,9 +29,10 @@ METADATA_CARRYOVER = {
 def parse_arguments():
 	parser = argparse.ArgumentParser(description="UD Importer")
 	parser.add_argument('--input', required=True, help='path to UD treebank in CoNLL-U format')
-	parser.add_argument('--output', required=True, help='path to output SQLite index')
-	parser.add_argument('--literal-level', default='character', help='level at which to store atomic literals (default: character)')
+	parser.add_argument('--output', required=True, help='path to output DECAF index')
+	parser.add_argument('--literal-level', default='token', help='level at which to store atomic literals (default: character)')
 	parser.add_argument('--commit-steps', type=int, help='number of steps after which to perform a backup commit (default: None)')
+	parser.add_argument('--shard-size', type=int, default=100000, help='number of sentences per shard (default: 100k)')
 	return parser.parse_args()
 
 
@@ -185,7 +186,7 @@ def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str) -> tup
 		structures += token_structures
 		hierarchies += token_hierarchies
 		tokens_by_id[token['id']] = token_structures[0]
-		token_cursor_idx += len(token_literals)
+		token_cursor_idx += sum(len(tl.value) for tl in token_literals)
 
 	# create hierarchical dependency structures
 	dependency_structures, dependency_hierarchies = parse_dependencies(
@@ -322,7 +323,6 @@ def parse_carryover(
 
 	literals = {s: v + next_literals for s, v in literals.items()}
 	sentences = {s: v + [next_sentence] for s, v in sentences.items()}
-	# output_hierarchies = list(set(output_hierarchies))  # remove redundant hierarchies
 
 	return carryover, literals, sentences, output_structures, output_hierarchies
 
@@ -338,13 +338,17 @@ def main():
 	print("="*13)
 
 	# set up associated DECAF index
-	decaf_index = DecafIndex(db_path=args.output)
-	print(f"Connected to DECAF index at '{args.output}'.")
+	decaf_index = DecafIndex(index_path=args.output)
+	decaf_index.initialize()
+	print(f"Connected to DECAF index at '{args.output}':")
+	print(decaf_index)
 
 	print(f"Loading UD treebank from '{args.input}'...")
+
 	# get total number of sentences
 	with open(args.input) as fp:
 		num_sentences = sum(1 for line in fp if line.startswith('1\t'))
+
 	# ingest sentences into DECAF index
 	with open(args.input) as fp, decaf_index as di:
 		num_literals, num_structures, num_hierarchies = di.get_size()
@@ -386,7 +390,18 @@ def main():
 				di.commit()
 				print(f"\nPerformed backup commit to index at '{args.output}'.")
 
-			cursor_idx += len(cur_literals)  # increment character-level cursor by number of atoms (i.e., characters)
+			# check if new shard should be created
+			if ((sentence_idx//args.shard_size) + 1) > len(di.shards):
+				# check for document boundary
+				if 'document' in carryover:
+					# wait for current document to end
+					if 'document' in cur_carryover:
+						di.add_shard()
+				else:
+					di.add_shard()
+
+			# increment character-level cursor by number of atoms (i.e., characters)
+			cursor_idx += sum(len(literal.value) for literal in cur_literals)
 
 		# process final carryover structures
 		_, _, _, new_structures, new_hierarchies = parse_carryover(
@@ -399,13 +414,9 @@ def main():
 
 		# compute number of added structures
 		new_num_literals, new_num_structures, new_num_hierarchies = di.get_size()
-		print(
-			f"\x1b[1K\rBuilt index with {new_num_literals - num_literals} literals "
-			f"and {new_num_structures - num_structures} structures "
-			f"with {new_num_hierarchies - num_hierarchies} hierarchical relations "
-			f"for {num_sentences} sentences "
-			f"from '{args.input}' "
-			f"in {time.time() - start_time:.2f}s.")
+		end_time = time.time()
+
+		print("completed.")
 
 		# print statistics
 		literal_counts = di.get_literal_counts()
@@ -417,6 +428,15 @@ def main():
 		print(f"Structure Statistics ({sum(structure_counts.values())} total; {len(structure_counts)} unique):")
 		for structure, count in sorted(structure_counts.items(), key=lambda i: i[1], reverse=True):
 			print(f"  '{structure}': {count} occurrences")
+
+		print(
+			f"Built index with {len(di.shards)} shard(s) containing "
+			f"{new_num_literals - num_literals} literals "
+			f"and {new_num_structures - num_structures} structures "
+			f"with {new_num_hierarchies - num_hierarchies} hierarchical relations "
+			f"for {num_sentences} sentences "
+			f"from '{args.input}' "
+			f"in {end_time - start_time:.2f}s.")
 
 	print(f"Saved updated DECAF index to '{args.output}'.")
 
