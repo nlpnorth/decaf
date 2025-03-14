@@ -2,8 +2,6 @@ import argparse
 import re
 import time
 
-from typing import Optional
-
 from decaf.index import Literal, Structure, DecafIndex
 
 from conllu import TokenList, TokenTree, Token, parse_incr
@@ -54,7 +52,7 @@ def get_carryover_field(field):
 # parser functions
 #
 
-def parse_token(token:Token, cursor_idx:int, literal_level:str, trailing_space:Optional[bool] = None) -> tuple[list[Literal], list[Structure], list[tuple[Structure, Structure]]]:
+def parse_token(token:Token, cursor_idx:int, literal_level:str) -> tuple[list[Literal], list[Structure], list[tuple[Structure, Structure]]]:
 	literals, structures, hierarchies = [], [], []
 
 	# create literals from characters
@@ -68,8 +66,6 @@ def parse_token(token:Token, cursor_idx:int, literal_level:str, trailing_space:O
 		literals.append(Literal(start=cursor_idx, end=cursor_idx + len(token['form']), value=token['form']))
 	else:
 		raise ValueError(f"Unknown literal level: '{literal_level}'.")
-
-	trailing_space = True if trailing_space is None else trailing_space
 
 	# create structures from UD's token-level annotations
 	# https://universaldependencies.org/format.html
@@ -100,10 +96,6 @@ def parse_token(token:Token, cursor_idx:int, literal_level:str, trailing_space:O
 					)
 				)
 				hierarchies.append((token_structure, structures[-1]))
-			# check for SpaceAfter=No MISC annotation
-			if ('SpaceAfter' in token[annotation]) and (token[annotation]['SpaceAfter'] == 'No'):
-				# prevent adding trailing space
-				trailing_space = False
 		# all other annotations are stored as token-level structures
 		else:
 			structures.append(
@@ -114,9 +106,6 @@ def parse_token(token:Token, cursor_idx:int, literal_level:str, trailing_space:O
 				)
 			)
 			hierarchies.append((token_structure, structures[-1]))
-
-	if trailing_space:
-		literals.append(Literal(start=end_idx, end=end_idx + 1, value=' '))
 
 	return literals, structures, hierarchies
 
@@ -157,36 +146,33 @@ def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str) -> tup
 	carryover = {}
 
 	# parse tokens in sentence
-	token_cursor_idx = int(cursor_idx)
+	sentence_cursor_idx = 0  # position within sentence
 	tokens_by_id = {}
-	multitoken_end = None
-	multitoken_space = None
 	for token_idx, token in enumerate(sentence):
 		# check for multi-tokens (e.g. "It's" -> "It 's"), identified by ID with range (e.g., '3-4')
 		if type(token['id']) is tuple:
-			multitoken_end = token['id'][-1]
-			if (token['misc'] is not None) and ('SpaceAfter' in token['misc']) and (token['misc']['SpaceAfter'] == 'No'):
-				multitoken_space = False
 			continue
-		# trailing space behaviour follows default, except within and at the end of multi-tokens
-		trailing_space = None
-		if multitoken_end is not None:
-			trailing_space = False
-			if token['id'] >= multitoken_end:
-				trailing_space = multitoken_space
-				multitoken_end, multitoken_space = None, None
 
 		# process token
 		token_literals, token_structures, token_hierarchies = parse_token(
-			token, token_cursor_idx,
-			literal_level=literal_level,
-			trailing_space=trailing_space
+			token, cursor_idx + sentence_cursor_idx,
+			literal_level=literal_level
 		)
 		literals += token_literals
 		structures += token_structures
 		hierarchies += token_hierarchies
 		tokens_by_id[token['id']] = token_structures[0]
-		token_cursor_idx += sum(len(tl.value) for tl in token_literals)
+		sentence_cursor_idx += sum(len(tl.value) for tl in token_literals)
+
+		# add trailing whitespaces
+		while (sentence_cursor_idx < len(sentence.metadata['text']) - 1) and (re.match(r'\s', sentence.metadata['text'][sentence_cursor_idx])):
+			literals.append(
+				Literal(
+					start=cursor_idx + sentence_cursor_idx,
+					end=cursor_idx + sentence_cursor_idx + 1,
+					value=sentence.metadata['text'][sentence_cursor_idx])
+			)
+			sentence_cursor_idx += 1
 
 	# create hierarchical dependency structures
 	dependency_structures, dependency_hierarchies = parse_dependencies(
@@ -197,7 +183,7 @@ def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str) -> tup
 	hierarchies = dependency_hierarchies + hierarchies
 
 	# create structures from UD's sentence-level annotations
-	start_idx, end_idx = cursor_idx, token_cursor_idx
+	start_idx, end_idx = cursor_idx, cursor_idx + sentence_cursor_idx
 	# sentence structure itself
 	sentence_structure = Structure(
 		start=start_idx, end=end_idx,
