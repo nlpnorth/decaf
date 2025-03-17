@@ -265,29 +265,31 @@ def parse_carryover(
 	# check if document changed
 	if 'document' in next_carryover:
 		document = None
+
 		# create document-level structures and flush metadata
-		for co_field, (co_value, co_start) in carryover.items():
-			# create separate document and document ID structures
-			if co_field == 'document':
-				document =Structure(
+		if 'document' in carryover:
+			for co_field, (co_value, co_start) in carryover.items():
+				# create separate document and document ID structures
+				if co_field == 'document':
+					document =Structure(
+							start=co_start, end=cursor_idx,
+							value=None, stype='document',
+							literals=literals['document']
+						)
+					co_field = 'document_id'
+
+				# skip re-processing of paragraph metadata
+				if co_field == 'paragraph':
+					continue
+
+				# add remaining document-level metadata
+				output_structures.append(
+					Structure(
 						start=co_start, end=cursor_idx,
-						value=None, stype='document',
+						value=co_value, stype=co_field,
 						literals=literals['document']
 					)
-				co_field = 'document_id'
-
-			# skip re-processing of paragraph metadata
-			if co_field == 'paragraph':
-				continue
-
-			# add remaining document-level metadata
-			output_structures.append(
-				Structure(
-					start=co_start, end=cursor_idx,
-					value=co_value, stype=co_field,
-					literals=literals['document']
 				)
-			)
 
 		# add document-level hierarchical structures
 		if document is not None:
@@ -304,9 +306,10 @@ def parse_carryover(
 
 		# reset all carryover data
 		carryover = next_carryover
-		literals = {s:[] for s in literals}
-		sentences = {s:[] for s in sentences}
+		literals = {s:[] for s in next_carryover}
+		sentences = {s:[] for s in next_carryover}
 
+	# keep track of literals and sentences that are part of an ongoing carryover structure
 	literals = {s: v + next_literals for s, v in literals.items()}
 	sentences = {s: v + [next_sentence] for s, v in sentences.items()}
 
@@ -333,7 +336,7 @@ def main():
 	if len(decaf_index.shards) > 0:
 		# retrieve number of previously indexed sentences
 		structure_counts = decaf_index.get_structure_counts()
-		num_indexed_sentences = structure_counts['sentence']
+		num_indexed_sentences = structure_counts.get('sentence', 0)
 		print(f"Loaded {num_indexed_sentences} indexed sentence(s).")
 	# case: initialize index from scratch
 	else:
@@ -351,8 +354,8 @@ def main():
 		num_literals, num_structures, num_hierarchies = di.get_size()
 		cursor_idx = 0  # initialize character-level dataset cursor
 		carryover = {}  # initialize cross-sentence carryover metadata (e.g., document/paragraph info)
-		carryover_literals = {s:[] for s in METADATA_CARRYOVER.values() if s is not None}  # initialize cross-sentence carryover literals for paragraphs and documents
-		carryover_sentences = {s:[] for s in METADATA_CARRYOVER.values() if s is not None}  # initialize carryover sentences for paragraphs and documents
+		carryover_literals = {}  # initialize cross-sentence carryover literals for paragraphs and documents
+		carryover_sentences = {}  # initialize carryover sentences for paragraphs and documents
 
 		# iterate over sentences
 		start_time = time.time()
@@ -365,19 +368,14 @@ def main():
 			cur_sentence = cur_structures[0]
 
 			# process carryover metadata
-			if sentence_idx == 0:
-				carryover = cur_carryover  # first carryover metadata is always retained
-				carryover_literals = {s:cur_literals for s in carryover_literals}
-				carryover_sentences = {s:[cur_sentence] for s in carryover_sentences}
-			else:
-				carryover, carryover_literals, carryover_sentences, new_structures, new_hierarchies  = parse_carryover(
-					carryover, cur_carryover,
-					carryover_literals, cur_literals,
-					carryover_sentences, cur_sentence,
-					cursor_idx
-				)
-				cur_structures += new_structures
-				cur_hierarchies += new_hierarchies
+			carryover, carryover_literals, carryover_sentences, new_structures, new_hierarchies  = parse_carryover(
+				carryover, cur_carryover,
+				carryover_literals, cur_literals,
+				carryover_sentences, cur_sentence,
+				cursor_idx
+			)
+			cur_structures += new_structures
+			cur_hierarchies += new_hierarchies
 
 			# skip adding sentences that are already in the index
 			if sentence_idx + 1 <= num_indexed_sentences:
