@@ -325,9 +325,20 @@ def main():
 
 	# set up associated DECAF index
 	decaf_index = DecafIndex(index_path=args.output)
-	decaf_index.initialize()
 	print(f"Connected to DECAF index at '{args.output}':")
 	print(decaf_index)
+
+	# check if DECAF index contains entries
+	num_indexed_sentences = 0
+	if len(decaf_index.shards) > 0:
+		# retrieve number of previously indexed sentences
+		structure_counts = decaf_index.get_structure_counts()
+		num_indexed_sentences = structure_counts['sentence']
+		print(f"Loaded {num_indexed_sentences} indexed sentence(s).")
+	# case: initialize index from scratch
+	else:
+		decaf_index.initialize()
+		print(f"Initialized index from scratch.")
 
 	print(f"Loading UD treebank from '{args.input}'...")
 
@@ -368,6 +379,10 @@ def main():
 				cur_structures += new_structures
 				cur_hierarchies += new_hierarchies
 
+			# skip adding sentences that are already in the index
+			if sentence_idx + 1 <= num_indexed_sentences:
+				continue
+
 			# insert sentence-level literals, structures, and hierarchies into index
 			di.add(literals=cur_literals, structures=cur_structures, hierarchies=cur_hierarchies)
 
@@ -390,13 +405,14 @@ def main():
 			cursor_idx += sum(len(literal.value) for literal in cur_literals)
 
 		# process final carryover structures
-		_, _, _, new_structures, new_hierarchies = parse_carryover(
-			carryover, {'document': ('end', -1), 'paragraph': ('end', -1)},
-			carryover_literals, [],
-			carryover_sentences, None,
-			cursor_idx
-		)
-		di.add(literals=[], structures=new_structures, hierarchies=new_hierarchies)
+		if num_indexed_sentences < num_sentences:
+			_, _, _, new_structures, new_hierarchies = parse_carryover(
+				carryover, {'document': ('end', -1), 'paragraph': ('end', -1)},
+				carryover_literals, [],
+				carryover_sentences, None,
+				cursor_idx
+			)
+			di.add(literals=[], structures=new_structures, hierarchies=new_hierarchies)
 
 		# compute number of added structures
 		new_num_literals, new_num_structures, new_num_hierarchies = di.get_size()
@@ -417,9 +433,9 @@ def main():
 
 		print(
 			f"Built index with {len(di.shards)} shard(s) containing "
-			f"{new_num_literals - num_literals} literals "
-			f"and {new_num_structures - num_structures} structures "
-			f"with {new_num_hierarchies - num_hierarchies} hierarchical relations "
+			f"{new_num_literals} literals ({new_num_literals - num_literals} new) "
+			f"and {new_num_structures} structures ({new_num_structures - num_structures} new) "
+			f"with {new_num_hierarchies} hierarchical relations ({new_num_hierarchies - num_hierarchies} new) "
 			f"for {num_sentences} sentences "
 			f"from '{args.input}' "
 			f"in {end_time - start_time:.2f}s.")
