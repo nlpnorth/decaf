@@ -119,8 +119,10 @@ def parse_dependencies(tree:TokenTree, token_structures:dict[int, Structure]):
 	start_idx, end_idx = token_structures[token_id].start, token_structures[token_id].end
 
 	# recursively process child nodes
+	children = []  # store direct children for hierarchy
 	for child in tree.children:
 		child_structures, child_hierarchies = parse_dependencies(tree=child, token_structures=token_structures)
+		children.append(child_structures[0])
 		structures += child_structures
 		hierarchies += child_hierarchies
 		literals += token_structures[child.token['id']].literals
@@ -134,9 +136,9 @@ def parse_dependencies(tree:TokenTree, token_structures:dict[int, Structure]):
 		literals=literals
 	)
 	hierarchies += \
-		[(dependency, child) for child in structures] + \
+		[(dependency, child) for child in children] + \
 		[(dependency, token_structures[token_id])]
-	structures.append(dependency)
+	structures = [dependency] + structures
 
 	return structures, hierarchies
 

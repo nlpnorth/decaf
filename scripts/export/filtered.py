@@ -55,8 +55,8 @@ def main():
 	output_level = 'structures'
 
 	with decaf_index as di:
-		num_atoms, num_structures, num_hierarchies = decaf_index.get_size()
-		print(f"Connected to DECAF index at '{args.index}' with {num_atoms} atom(s) and {num_structures} structure(s) in {num_hierarchies} hierarchies.")
+		num_literals, num_structures, num_hierarchies = decaf_index.get_size()
+		print(f"Connected to DECAF index at '{args.index}' with {num_literals} literal(s) and {num_structures} structure(s) in {num_hierarchies} hierarchies.")
 
 		print("Constructed SQL query from constraints:")
 		print('```')
@@ -70,6 +70,8 @@ def main():
 		query_start_time = time.time()
 
 		outputs = di.filter(constraint=constraint, output_level=output_level)
+
+		query_end_time = time.time()
 
 		# initialize output file pointer (if specified)
 		output_file = None
@@ -89,8 +91,8 @@ def main():
 
 	print(
 		f"\nCompleted retrieval of {num_matches} match(es) from DECAF index "
-		f"with {num_atoms} atom(s) and {num_structures} structure(s) "
-		f"in {time.time() - query_start_time:.2f}s."
+		f"with {num_literals} literal(s) and {num_structures} structure(s) "
+		f"in {query_end_time - query_start_time:.2f}s."
 	)
 
 
