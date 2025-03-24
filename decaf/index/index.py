@@ -310,14 +310,28 @@ class DecafIndex:
 
 		return literal_counts
 
-	def get_structure_counts(self):
+	def get_structure_counts(self, types=None, values=False):
 		structure_counts = {}
+
+		# count types versus (type, value) pairs
+		fields = 'type'
+		if values:
+			fields += ', value'
+
+		# apply type filtering
+		type_constraint = ''
+		if types is not None:
+			type_set = ','.join('"' + t + '"' for t in types)
+			type_constraint = f'WHERE type IN ({type_set})'
 
 		for connection in self.connections():
 			cursor = connection.cursor()
-			cursor.execute('SELECT type, COUNT(type) AS total FROM structures GROUP BY type')
-			for structure, count in cursor.fetchall():
-				structure_counts[structure] = structure_counts.get(structure, 0) + count
+			cursor.execute(f'SELECT {fields}, COUNT(*) AS total FROM structures {type_constraint} GROUP BY {fields}')
+			for row in cursor.fetchall():
+				structure = row[0]
+				if values:
+					structure = tuple(row[:2])
+				structure_counts[structure] = structure_counts.get(structure, 0) + row[-1]
 
 		return structure_counts
 
