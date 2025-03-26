@@ -36,7 +36,7 @@ class DecafIndex:
 		self.connected_shard = None
 
 	def __repr__(self):
-		return f'''<DecafIndex: {len(self.shards)} shard(s), {'dis' if self.connection is None else ''}connected>'''
+		return f'''<DecafIndex: '{os.path.basename(self.index_path)}', {len(self.shards)} shard(s)>'''
 
 	def __enter__(self):
 		self.connect()
@@ -54,8 +54,9 @@ class DecafIndex:
 	#
 
 	def connect(self, shard=0):
-		self.connection =  sqlite3.connect(self.shards[shard])
-		self.connected_shard = shard
+		if self.connected_shard != shard:
+			self.connection =  sqlite3.connect(self.shards[shard])
+			self.connected_shard = shard
 		return self.connection
 
 	def disconnect(self):
@@ -178,24 +179,23 @@ class DecafIndex:
 	# export functions
 	#
 
-	@requires_connection
-	def export_ranges(self, ranges):
-		cursor = self.connection.cursor()
-
-		for start, end in ranges:
+	def export_ranges(self, ranges:list[tuple[int,int,int,int]]):
+		for shard, structure_id, start, end in ranges:
+			self.connect(shard=shard)
+			cursor = self.connection.cursor()
 			query = 'SELECT GROUP_CONCAT(value, "") as export FROM literals WHERE start >= ? AND end <= ?'
 			cursor.execute(query, (start, end))
 			yield cursor.fetchone()[0]
+		self.disconnect()
 
-	@requires_connection
-	def export_masked(self, mask_ranges):
+	def export_masked(self, mask_ranges:list[tuple[int,int,int,int]]):
 		num_literals, _, _ = self.get_size()
 		mask_ranges += [(None, num_literals, num_literals)]
 
-		cursor = self.connection.cursor()
-
 		start = 0
-		for mask_id, mask_start, mask_end in mask_ranges:
+		for shard, mask_id, mask_start, mask_end in mask_ranges:
+			self.connect(shard=shard)
+			cursor = self.connection.cursor()
 			end = mask_start
 			query = 'SELECT GROUP_CONCAT(value, "") as export FROM literals WHERE start >= ? AND end <= ?'
 			cursor.execute(query, (start, end))
@@ -204,6 +204,37 @@ class DecafIndex:
 				yield output
 
 			start = mask_end
+		self.disconnect()
+
+	def export_structures(self, structures:list[tuple[int,int]]):
+		# group structures by shard for faster retrieval
+		structures_by_shard = {s:[] for s in range(len(self.shards))}
+		for shard, structure in structures:
+			structures_by_shard[shard].append(structure)
+
+		# run per-shard retrieval
+		shard_exports = {}
+		for shard, shard_structures in structures_by_shard.items():
+			self.connect(shard=shard)
+			cursor = self.connection.cursor()
+			query = f'''
+				SELECT structures.id, GROUP_CONCAT(literals.value, "") as export 
+				FROM (
+					SELECT * 
+					FROM structures 
+					WHERE id IN ({','.join(str(sid) for sid in shard_structures)})
+				) AS structures 
+				JOIN structure_literals 
+				JOIN literals 
+				ON (structure_literals.structure = structures.id AND structure_literals.literal = literals.id) 
+				GROUP BY structures.id'''
+			cursor.execute(query)
+			shard_exports[shard] = {sid:export for sid, export in cursor.fetchall()}
+		self.disconnect()
+
+		# export in original order
+		for shard, structure in structures:
+			yield shard_exports[shard][structure]
 
 	#
 	# filtering functions
@@ -247,36 +278,35 @@ class DecafIndex:
 
 		return query
 
-	@requires_connection
-	def get_filter_ranges(self, constraint, output_level):
-		cursor = self.connection.cursor()
-
-		# execute constructed query
-		query = self._construct_filter_query(
-			constraint=constraint,
-			output_level=output_level
-		)
-		cursor.execute(query)
-
-		return cursor.fetchall()
-
-	def filter(self, constraint, output_level='structures'):
+	def get_filter_ranges(self, constraint, output_level='structures'):
 		for shard_idx, connection in enumerate(self.connections()):
-			filter_ranges = self.get_filter_ranges(
+			cursor = self.connection.cursor()
+
+			# execute constructed query
+			query = self._construct_filter_query(
 				constraint=constraint,
 				output_level=output_level
 			)
-			for structure_id, start, end in filter_ranges:
-				yield (shard_idx, structure_id), start, end, next(self.export_ranges([(start, end)]))
+			cursor.execute(query)
+
+			for structure_id, start, end in cursor.fetchall():
+				yield shard_idx, structure_id, start, end
+
+	def filter(self, constraint, output_level='structures'):
+		filter_ranges = self.get_filter_ranges(
+			constraint=constraint,
+			output_level=output_level
+		)
+		for shard_idx, structure_id, start, end in filter_ranges:
+			yield shard_idx, structure_id, start, end, next(self.export_ranges([(shard_idx, structure_id, start, end)]))
 
 	def mask(self, constraint, mask_level='structures'):
-		for connection in self.connections():
-			filter_ranges = self.get_filter_ranges(
-				constraint=constraint,
-				output_level=mask_level
-			)
-			for output in self.export_masked(mask_ranges=filter_ranges):
-				yield output
+		filter_ranges = self.get_filter_ranges(
+			constraint=constraint,
+			output_level=mask_level
+		)
+		for output in self.export_masked(mask_ranges=filter_ranges):
+			yield output
 
 	#
 	# statistics functions
@@ -310,13 +340,15 @@ class DecafIndex:
 
 		return literal_counts
 
-	def get_structure_counts(self, types=None, values=False):
+	def get_structure_counts(self, types=None, values=False, literals=False):
 		structure_counts = {}
 
 		# count types versus (type, value) pairs
 		fields = 'type'
 		if values:
 			fields += ', value'
+		if literals:
+			fields += ', literal'
 
 		# apply type filtering
 		type_constraint = ''
@@ -324,13 +356,27 @@ class DecafIndex:
 			type_set = ','.join('"' + t + '"' for t in types)
 			type_constraint = f'WHERE type IN ({type_set})'
 
+		# add literals
+		structure_table = f'structures {type_constraint}'
+		if literals:
+			structure_table = f'''
+				SELECT structures.type, structures.value, GROUP_CONCAT(literals.value, "") as literal
+				FROM (
+					(SELECT * FROM {structure_table}) AS structures 
+					JOIN structure_literals 
+					JOIN literals
+					ON (structure_literals.structure = structures.id AND structure_literals.literal = literals.id)
+				) GROUP BY structures.id
+			'''
+			structure_table = '(' + structure_table + ')'
+
 		for connection in self.connections():
 			cursor = connection.cursor()
-			cursor.execute(f'SELECT {fields}, COUNT(*) AS total FROM structures {type_constraint} GROUP BY {fields}')
+			cursor.execute(f'SELECT {fields}, COUNT(*) AS total FROM {structure_table} GROUP BY {fields}')
 			for row in cursor.fetchall():
-				structure = row[0]
-				if values:
-					structure = tuple(row[:2])
+				structure = row[:-1]
+				if len(structure) == 1:
+					structure = structure[0]
 				structure_counts[structure] = structure_counts.get(structure, 0) + row[-1]
 
 		return structure_counts
