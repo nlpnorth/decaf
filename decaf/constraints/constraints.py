@@ -15,7 +15,7 @@ class Condition:
 		return self.literals is not None
 
 	def to_sql(self, literals=True, column_prefix=''):
-		sql = f'{column_prefix}"type={self.type}" IS NOT NULL'
+		sql = f'{column_prefix}"type={self.type}" IS {"NOT" if self.values else ""} NULL'
 		if self.values is not None:
 			query_match = ' OR '.join(f"({column_prefix}\"type={self.type}\" {self.match} '{v}')" for v in self.values)
 			sql += f' AND ({query_match})'
@@ -70,7 +70,7 @@ class Criterion:
 		return sql
 
 
-class Constraint:
+class Filter:
 	def __init__(self, criteria:list[Criterion], sequential:bool=False, hierarchy:Optional[list[str]]=None):
 		self.criteria = criteria
 		self.sequential = sequential

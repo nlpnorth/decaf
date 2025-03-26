@@ -1,1 +1,1 @@
-from .constraints import Constraint, Criterion, Condition
+from .constraints import Filter, Criterion, Condition
