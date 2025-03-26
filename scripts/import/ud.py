@@ -29,6 +29,7 @@ def parse_arguments():
 	parser.add_argument('--input', required=True, help='path to UD treebank in CoNLL-U format')
 	parser.add_argument('--output', required=True, help='path to output DECAF index')
 	parser.add_argument('--literal-level', default='token', help='level at which to store atomic literals (default: character)')
+	parser.add_argument('--force-alignment', action='store_true', default=False, help='set flag to force alignment between tokens and text (default: False)')
 	parser.add_argument('--commit-steps', type=int, help='number of steps after which to perform a backup commit (default: None)')
 	parser.add_argument('--shard-size', type=int, default=100000, help='number of sentences per shard (default: 100k)')
 	return parser.parse_args()
@@ -115,7 +116,7 @@ def parse_dependencies(tree:TokenTree, token_structures:dict[int, Structure]):
 
 	relation = tree.token['deprel']
 	token_id = tree.token['id']
-	literals = token_structures[token_id].literals
+	literals = [l for l in token_structures[token_id].literals]
 	start_idx, end_idx = token_structures[token_id].start, token_structures[token_id].end
 
 	# recursively process child nodes
@@ -133,7 +134,7 @@ def parse_dependencies(tree:TokenTree, token_structures:dict[int, Structure]):
 	dependency = Structure(
 		start=start_idx, end=end_idx,
 		value=relation, stype='dependency',
-		literals=literals
+		literals=[l for l in literals]
 	)
 	hierarchies += \
 		[(dependency, child) for child in children] + \
@@ -143,38 +144,73 @@ def parse_dependencies(tree:TokenTree, token_structures:dict[int, Structure]):
 	return structures, hierarchies
 
 
-def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str) -> tuple[list[Literal], list[Structure], list[tuple[Structure,Structure]], dict]:
+def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str, force_alignment:bool=False) -> tuple[list[Literal], list[Structure], list[tuple[Structure,Structure]], dict]:
 	literals, structures, hierarchies = [], [], []
 	carryover = {}
 
 	# parse tokens in sentence
-	sentence_cursor_idx = 0  # position within sentence
+	sentence_tokens = [token for token in sentence if type(token['id']) is not tuple]  # remove multi-tokens (e.g. "It's" -> "It 's"), identified by ID with range (e.g., '3-4')
+	text_cursor_idx = 0  # position within sentence
 	tokens_by_id = {}
-	for token_idx, token in enumerate(sentence):
-		# check for multi-tokens (e.g. "It's" -> "It 's"), identified by ID with range (e.g., '3-4')
-		if type(token['id']) is tuple:
-			continue
-
+	for token_idx, token in enumerate(sentence_tokens):
 		# process token
 		token_literals, token_structures, token_hierarchies = parse_token(
-			token, cursor_idx + sentence_cursor_idx,
+			token, cursor_idx + text_cursor_idx,
 			literal_level=literal_level
 		)
 		literals += token_literals
 		structures += token_structures
 		hierarchies += token_hierarchies
 		tokens_by_id[token['id']] = token_structures[0]
-		sentence_cursor_idx += sum(len(tl.value) for tl in token_literals)
+		text_cursor_idx += sum(len(tl.value) for tl in token_literals)
 
 		# add trailing whitespaces
-		while (sentence_cursor_idx < len(sentence.metadata['text']) - 1) and (re.match(r'\s', sentence.metadata['text'][sentence_cursor_idx])):
+		if force_alignment:
+			# scan for continuation in sentence text
+			while (text_cursor_idx < len(sentence.metadata['text']) - 1) and (re.match(r'\s', sentence.metadata['text'][text_cursor_idx])):
+				literals.append(
+					Literal(
+						start=cursor_idx + text_cursor_idx,
+						end=cursor_idx + text_cursor_idx + 1,
+						value=sentence.metadata['text'][text_cursor_idx])
+				)
+				text_cursor_idx += 1
+		else:
+			# add default whitespace
 			literals.append(
 				Literal(
-					start=cursor_idx + sentence_cursor_idx,
-					end=cursor_idx + sentence_cursor_idx + 1,
-					value=sentence.metadata['text'][sentence_cursor_idx])
+					start=cursor_idx + text_cursor_idx,
+					end=cursor_idx + text_cursor_idx + 1,
+					value=' ')
 			)
-			sentence_cursor_idx += 1
+			text_cursor_idx += 1
+
+		# add intermediate, non-token literal (e.g., whitespaces)
+		# intermediate_literal = ''
+		# while text_cursor_idx < len(sentence.metadata['text']):
+		# 	# fast-forward through whitespaces
+		# 	if re.match(r'\s', sentence.metadata['text'][text_cursor_idx]):
+		# 		intermediate_literal += sentence.metadata['text'][text_cursor_idx]
+		# 		text_cursor_idx += 1
+		# 		continue
+		# 	# check for next token
+		# 	if token_idx < len(sentence_tokens) - 1:
+		# 		# remove all incorrectly added whitespaces for comparison
+		# 		next_token = re.sub(r'\s', '', sentence_tokens[token_idx + 1]['form'])
+		# 		sentence_continuation =  re.sub(r'\s', '', sentence.metadata['text'][text_cursor_idx:])
+		# 		if sentence_continuation.startswith(next_token):
+		# 			break
+		# 	# increment cursor, and ignore non-whitespace characters
+		# 	intermediate_literal += ' '
+		# 	text_cursor_idx += 1
+		#
+		# if len(intermediate_literal) > 0:
+		# 	literals.append(
+		# 		Literal(
+		# 			start=cursor_idx + text_cursor_idx - len(intermediate_literal),
+		# 			end=cursor_idx + text_cursor_idx,
+		# 			value=intermediate_literal)
+		# 	)
 
 	# create hierarchical dependency structures
 	dependency_structures, dependency_hierarchies = parse_dependencies(
@@ -185,7 +221,7 @@ def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str) -> tup
 	hierarchies = dependency_hierarchies + hierarchies
 
 	# create structures from UD's sentence-level annotations
-	start_idx, end_idx = cursor_idx, cursor_idx + sentence_cursor_idx
+	start_idx, end_idx = cursor_idx, cursor_idx + text_cursor_idx
 	# sentence structure itself
 	sentence_structure = Structure(
 		start=start_idx, end=end_idx,
@@ -240,7 +276,7 @@ def parse_carryover(
 			paragraph = Structure(
 					start=paragraph_start_idx, end=cursor_idx,
 					value=None, stype='paragraph',
-					literals=literals['paragraph']
+					literals=[l for l in literals['paragraph']]
 				)
 			output_structures.append(paragraph)
 
@@ -249,7 +285,7 @@ def parse_carryover(
 					Structure(
 						start=paragraph_start_idx, end=cursor_idx,
 						value=paragraph_id, stype='paragraph_id',
-						literals=literals['paragraph']
+						literals=[l for l in literals['paragraph']]
 					)
 				)
 
@@ -276,7 +312,7 @@ def parse_carryover(
 					document =Structure(
 							start=co_start, end=cursor_idx,
 							value=None, stype='document',
-							literals=literals['document']
+							literals=[l for l in literals['document']]
 						)
 					co_field = 'document_id'
 
@@ -289,7 +325,7 @@ def parse_carryover(
 					Structure(
 						start=co_start, end=cursor_idx,
 						value=co_value, stype=co_field,
-						literals=literals['document']
+						literals=[l for l in literals['document']]
 					)
 				)
 
