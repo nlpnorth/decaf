@@ -30,6 +30,7 @@ def parse_arguments():
 	parser.add_argument('--output', required=True, help='path to output DECAF index')
 	parser.add_argument('--literal-level', default='token', help='level at which to store atomic literals (default: character)')
 	parser.add_argument('--force-alignment', action='store_true', default=False, help='set flag to force alignment between tokens and text (default: False)')
+	parser.add_argument('--sentence-terminator', default=' ', help='terminator to add after each sentence (default: [space])')
 	parser.add_argument('--commit-steps', type=int, help='number of steps after which to perform a backup commit (default: None)')
 	parser.add_argument('--shard-size', type=int, default=100000, help='number of sentences per shard (default: 100k)')
 	return parser.parse_args()
@@ -122,11 +123,11 @@ def parse_dependencies(tree:TokenTree, token_structures:dict[int, Structure]):
 	# recursively process child nodes
 	children = []  # store direct children for hierarchy
 	for child in tree.children:
-		child_structures, child_hierarchies = parse_dependencies(tree=child, token_structures=token_structures)
+		child_structures, child_hierarchies, child_literals = parse_dependencies(tree=child, token_structures=token_structures)
 		children.append(child_structures[0])
 		structures += child_structures
 		hierarchies += child_hierarchies
-		literals += token_structures[child.token['id']].literals
+		literals += child_literals
 		start_idx = min(start_idx, token_structures[child.token['id']].start)
 		end_idx = max(end_idx, token_structures[child.token['id']].end)
 
@@ -137,14 +138,14 @@ def parse_dependencies(tree:TokenTree, token_structures:dict[int, Structure]):
 		literals=[l for l in literals]
 	)
 	hierarchies += \
-		[(dependency, child) for child in children] + \
-		[(dependency, token_structures[token_id])]
+		[(dependency, token_structures[token_id])] + \
+		[(dependency, child) for child in children]
 	structures = [dependency] + structures
 
-	return structures, hierarchies
+	return structures, hierarchies, literals
 
 
-def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str, force_alignment:bool=False) -> tuple[list[Literal], list[Structure], list[tuple[Structure,Structure]], dict]:
+def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str, force_alignment:bool=False, sentence_terminator:str='') -> tuple[list[Literal], list[Structure], list[tuple[Structure,Structure]], dict]:
 	literals, structures, hierarchies = [], [], []
 	carryover = {}
 
@@ -174,6 +175,7 @@ def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str, force_
 						end=cursor_idx + text_cursor_idx + 1,
 						value=sentence.metadata['text'][text_cursor_idx])
 				)
+				token_structures[0].literals.append(literals[-1])
 				text_cursor_idx += 1
 		else:
 			# add default whitespace
@@ -183,6 +185,7 @@ def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str, force_
 					end=cursor_idx + text_cursor_idx + 1,
 					value=' ')
 			)
+			token_structures[0].literals.append(literals[-1])
 			text_cursor_idx += 1
 
 		# add intermediate, non-token literal (e.g., whitespaces)
@@ -212,8 +215,18 @@ def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str, force_
 		# 			value=intermediate_literal)
 		# 	)
 
+	# add sentence terminator
+	if sentence_terminator:
+		literals.append(
+			Literal(
+				start=cursor_idx + text_cursor_idx,
+				end=cursor_idx + text_cursor_idx + 1,
+				value=sentence_terminator)
+		)
+		text_cursor_idx += 1
+
 	# create hierarchical dependency structures
-	dependency_structures, dependency_hierarchies = parse_dependencies(
+	dependency_structures, dependency_hierarchies, _ = parse_dependencies(
 		tree=sentence.to_tree(),
 		token_structures=tokens_by_id
 	)
@@ -401,7 +414,9 @@ def main():
 			print(f"\x1b[1K\r[{sentence_idx + 1}/{num_sentences} | {(sentence_idx + 1)/num_sentences:.2%}] Building index...", end='', flush=True)
 			cur_literals, cur_structures, cur_hierarchies, cur_carryover = parse_sentence(
 				sentence, cursor_idx,
-				literal_level=args.literal_level
+				literal_level=args.literal_level,
+				force_alignment=args.force_alignment,
+				sentence_terminator=args.sentence_terminator
 			)
 			cur_sentence = cur_structures[0]
 
@@ -457,15 +472,15 @@ def main():
 		print("completed.")
 
 		# print statistics
-		literal_counts = di.get_literal_counts()
-		print(f"Literal Statistics ({sum(literal_counts.values())} total; {len(literal_counts)} unique):")
-		for atom, count in sorted(literal_counts.items(), key=lambda i: i[1], reverse=True):
-			print(f"  '{atom}': {count} occurrences")
-
-		structure_counts = di.get_structure_counts()
-		print(f"Structure Statistics ({sum(structure_counts.values())} total; {len(structure_counts)} unique):")
-		for structure, count in sorted(structure_counts.items(), key=lambda i: i[1], reverse=True):
-			print(f"  '{structure}': {count} occurrences")
+		# literal_counts = di.get_literal_counts()
+		# print(f"Literal Statistics ({sum(literal_counts.values())} total; {len(literal_counts)} unique):")
+		# for atom, count in sorted(literal_counts.items(), key=lambda i: i[1], reverse=True):
+		# 	print(f"  '{atom}': {count} occurrences")
+		#
+		# structure_counts = di.get_structure_counts()
+		# print(f"Structure Statistics ({sum(structure_counts.values())} total; {len(structure_counts)} unique):")
+		# for structure, count in sorted(structure_counts.items(), key=lambda i: i[1], reverse=True):
+		# 	print(f"  '{structure}': {count} occurrences")
 
 		print(
 			f"Built index with {len(di.shards)} shard(s) containing "
