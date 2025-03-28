@@ -4,8 +4,6 @@ import sqlite3
 
 from importlib import resources
 
-import pandas as pd
-
 from decaf.index import Literal, Structure
 from decaf.index.views import construct_views
 
@@ -404,6 +402,13 @@ class DecafIndex:
 		return structure_counts
 
 	def get_cooccurence(self, source_constraint, target_constraint):
+		# try importing Pandas
+		try:
+			import pandas as pd
+		except ImportError as error:
+			print(f"[Error] To run analyze more complex statistics, please install external dependencies:\n> pip install decaf[full]")
+			raise error
+		# build co-occurrence frame
 		cooccurrence = pd.DataFrame(dtype=int)
 
 		# prepare views for easier retrieval
