@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 
 from importlib import resources
@@ -179,31 +180,19 @@ class DecafIndex:
 	# export functions
 	#
 
-	def export_ranges(self, ranges:list[tuple[int,int,int,int]]):
+	def export_ranges(self, ranges:list[tuple[int,int,int,int]], invert=False):
 		for shard, structure_id, start, end in ranges:
 			self.connect(shard=shard)
 			cursor = self.connection.cursor()
-			query = 'SELECT GROUP_CONCAT(value, "") as export FROM literals WHERE start >= ? AND end <= ?'
-			cursor.execute(query, (start, end))
-			yield cursor.fetchone()[0]
-		self.disconnect()
-
-	def export_masked(self, mask_ranges:list[tuple[int,int,int,int]]):
-		num_literals, _, _ = self.get_size()
-		mask_ranges += [(None, num_literals, num_literals)]
-
-		start = 0
-		for shard, mask_id, mask_start, mask_end in mask_ranges:
-			self.connect(shard=shard)
-			cursor = self.connection.cursor()
-			end = mask_start
-			query = 'SELECT GROUP_CONCAT(value, "") as export FROM literals WHERE start >= ? AND end <= ?'
+			query = f'''
+				SELECT GROUP_CONCAT(value, "") as export 
+				FROM literals 
+				WHERE start {'<' if invert else '>='} ? AND end {'>' if invert else '<='} ?
+			'''
 			cursor.execute(query, (start, end))
 			output = cursor.fetchone()[0]
 			if output is not None:
 				yield output
-
-			start = mask_end
 		self.disconnect()
 
 	def export_structures(self, structures:list[tuple[int,int]]):
@@ -235,6 +224,37 @@ class DecafIndex:
 		# export in original order
 		for shard, structure in structures:
 			yield shard_exports[shard][structure]
+
+	def export_masked(self, masked_structures:list[tuple[int,int]]):
+		export = ''
+
+		# group structures by shard for faster retrieval
+		structures_by_shard = {s:[] for s in range(len(self.shards))}
+		for shard, structure in masked_structures:
+			structures_by_shard[shard].append(structure)
+
+		# run per-shard retrieval
+		for shard, shard_structures in structures_by_shard.items():
+			self.connect(shard=shard)
+			cursor = self.connection.cursor()
+			query = f'''
+				SELECT GROUP_CONCAT(value, "") as export
+				FROM literals
+				WHERE id NOT IN (
+				    SELECT literal
+				    FROM literals
+				    JOIN (
+				        SELECT *
+				        FROM structure_literals
+				        WHERE structure IN ({','.join(str(sid) for sid in shard_structures)})
+				    ) AS structure_literals
+				    ON (structure_literals.literal = literals.id)
+				)'''
+			cursor.execute(query)
+			export += cursor.fetchone()[0]
+		self.disconnect()
+
+		return export
 
 	#
 	# filtering functions
@@ -298,15 +318,17 @@ class DecafIndex:
 			output_level=output_level
 		)
 		for shard_idx, structure_id, start, end in filter_ranges:
-			yield shard_idx, structure_id, start, end, next(self.export_ranges([(shard_idx, structure_id, start, end)]))
+			yield shard_idx, structure_id, start, end, next(self.export_structures([(shard_idx, structure_id)]))
 
-	def mask(self, constraint, mask_level='structures'):
+	def mask(self, constraint, mask_level='structures', clean_whitespace=True):
 		filter_ranges = self.get_filter_ranges(
 			constraint=constraint,
 			output_level=mask_level
 		)
-		for output in self.export_masked(mask_ranges=filter_ranges):
-			yield output
+		export = self.export_masked([(shard_idx, structure_id) for shard_idx, structure_id, start, end in filter_ranges])
+		if clean_whitespace:
+			export = re.sub(r'(\s)+', r'\1', export)
+		return export
 
 	#
 	# statistics functions
@@ -427,7 +449,11 @@ class DecafIndex:
 			).fillna(0)
 
 			# merge across shards
-			shard_co = shard_co.reindex(columns=set().union(cooccurrence.columns, shard_co.columns), fill_value=0)  # fill in missing columns
+			shard_co = shard_co.reindex(
+				index=set().union(cooccurrence.index, shard_co.index),
+				columns=set().union(cooccurrence.columns, shard_co.columns),
+				fill_value=0
+			)  # fill in missing columns
 			cooccurrence = cooccurrence.add(shard_co, fill_value=0)
 
 		cooccurrence = cooccurrence.astype(int)
