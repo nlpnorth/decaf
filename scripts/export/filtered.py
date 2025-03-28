@@ -4,7 +4,7 @@ import time
 import sqlparse
 
 from decaf.index import DecafIndex
-from decaf.constraints import Constraint, Criterion, Condition
+from decaf.filters import Filter, Criterion, Condition
 
 
 def parse_arguments():
@@ -29,7 +29,7 @@ def main():
 	# upos='ADJ'
 	# upos='NOUN' and Number='Plur'
 	# occurring in a sequence
-	constraint = Constraint(
+	constraint = Filter(
 		criteria=[
 			Criterion(
 				conditions=[
@@ -79,8 +79,8 @@ def main():
 			output_file = open(args.output, 'w', encoding='utf8')
 
 		num_matches = 0
-		for sid, start, end, export in outputs:
-			print(f"\n[ID {sid} | {start}-{end}] '{export}'")
+		for shard_idx, structure_id, start, end, export in outputs:
+			print(f"\n[ID ({shard_idx}/{structure_id}) | {start}-{end}] '{export}'")
 			if output_file is not None:
 				output_file.write(export + '\n')
 			num_matches += 1

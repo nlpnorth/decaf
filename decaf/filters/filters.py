@@ -15,7 +15,9 @@ class Condition:
 		return self.literals is not None
 
 	def to_sql(self, literals=True, column_prefix=''):
-		sql = f'{column_prefix}"type={self.type}" IS {"NOT" if self.values else ""} NULL'
+		sql = f'{column_prefix}"type={self.type}" IS NOT NULL'
+		if self.values is None:
+			sql += f' OR ({column_prefix}"type={self.type}" IS NULL)'
 		if self.values is not None:
 			query_match = ' OR '.join(f"({column_prefix}\"type={self.type}\" {self.match} '{v}')" for v in self.values)
 			sql += f' AND ({query_match})'

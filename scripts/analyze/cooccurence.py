@@ -2,7 +2,7 @@ import argparse
 import time
 
 from decaf.index import DecafIndex
-from decaf.constraints import Constraint, Criterion, Condition
+from decaf.filters import Filter, Criterion, Condition
 
 
 def parse_arguments():
@@ -25,7 +25,7 @@ def main():
 	decaf_index = DecafIndex(index_path=args.index)
 
 	# set up types to compute co-occurrence for
-	source_constraint = Constraint(
+	source_constraint = Filter(
 		criteria=[
 			Criterion(
 				operation='OR',
@@ -34,7 +34,7 @@ def main():
 		],
 		hierarchy=args.source_hierarchy
 	)
-	target_constraint = Constraint(
+	target_constraint = Filter(
 		criteria=[
 			Criterion(
 				operation='OR',
