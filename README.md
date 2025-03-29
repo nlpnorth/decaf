@@ -1,4 +1,4 @@
-<img src="decaf.png" alt="DECAF Logo" style="height: 10em"/>
+<img src="https://raw.githubusercontent.com/nlpnorth/decaf/main/decaf.png" alt="DECAF Logo" style="height: 10em"/>
 
 # DECAF: A Dynamically Extensible Corpus Analysis Framework
 
