@@ -56,9 +56,9 @@ def main():
 
 		print("Querying index...")
 		query_start_time = time.time()
-		cooccurrence = di.get_cooccurence(
-			source_constraint=source_constraint,
-			target_constraint=target_constraint
+		cooccurrence = di.get_cooccurrence(
+			source_filter=source_constraint,
+			target_filter=target_constraint
 		)
 		print("Co-occurrence:")
 		print(cooccurrence)

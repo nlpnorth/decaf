@@ -401,7 +401,7 @@ class DecafIndex:
 
 		return structure_counts
 
-	def get_cooccurence(self, source_constraint, target_constraint):
+	def get_cooccurrence(self, source_filter, target_filter):
 		# try importing Pandas
 		try:
 			import pandas as pd
@@ -412,20 +412,20 @@ class DecafIndex:
 		cooccurrence = pd.DataFrame(dtype=int)
 
 		# prepare views for easier retrieval
-		source_views = construct_views(constraint=source_constraint, view_prefix='source_')
-		target_views = construct_views(constraint=target_constraint, view_prefix='target_')
+		source_views = construct_views(constraint=source_filter, view_prefix='source_')
+		target_views = construct_views(constraint=target_filter, view_prefix='target_')
 
 		# select the relevant view based on constraints
 		relevant_view = 'filtered_substructures'  # default: relevant structures without constraint
 		join_criterion = 'srv.start = trv.start AND srv.end = trv.end'  # default: structures occurring at matching positions
 
-		if (source_constraint.hierarchy is not None) and (target_constraint.hierarchy is not None):
+		if (source_filter.hierarchy is not None) and (target_filter.hierarchy is not None):
 			relevant_view = 'filtered_constrained_substructures'
 			join_criterion = 'srv.structure_id = trv.structure_id'  # match at the level of parent structures (e.g., sentences)
 
 		# construct final query
-		sources_column = " || ' | ' || ".join(f"'{t}=' || srv.\"type={t}\"" for t in source_constraint.get_types())
-		targets_column = " || ' | ' || ".join(f"'{t}=' || trv.\"type={t}\"" for t in target_constraint.get_types())
+		sources_column = " || ' | ' || ".join(f"'{t}=' || srv.\"type={t}\"" for t in source_filter.get_types())
+		targets_column = " || ' | ' || ".join(f"'{t}=' || trv.\"type={t}\"" for t in target_filter.get_types())
 		query = f'''
 		SELECT
 	        {sources_column} as sources,
@@ -437,8 +437,8 @@ class DecafIndex:
 		    target_{relevant_view} AS trv
 		    ON ({join_criterion})
 		GROUP BY 
-			{', '.join(f'srv."type={t}"' for t in source_constraint.get_types())}, 
-			{', '.join(f'trv."type={t}"' for t in target_constraint.get_types())}
+			{', '.join(f'srv."type={t}"' for t in source_filter.get_types())}, 
+			{', '.join(f'trv."type={t}"' for t in target_filter.get_types())}
 		'''
 		query = source_views + ', ' + target_views[5:] + query
 
