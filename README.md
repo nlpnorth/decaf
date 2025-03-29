@@ -9,20 +9,18 @@ DECAF is an open-source Python framework that enables fine-grained linguistic an
 For basic analyses and filtering, DECAF can be installed without any external dependencies:
 
 ```bash
-pip install decaf
+pip install decaffinate
 ```
 
 For importing datasets, and for more advanced analyses, please install the package with external dependencies:
 
 ```bash
-pip install decaf[full]
+pip install decaffinate[full]
 ```
 
 For getting a quick overview of DECAF's core functionalities, we recommend taking a look at [the demo notebook](experiments/acl-demo/acl-demo.ipynb).
 
 ## Building an Index
-
-![DECAF imports datasets into separate indices over raw literals and annotation structures, which allow for easy analyses and filtered training data interventions.](experiments/acl-demo/rsrc/design-principles.png)
 
 Rather than creating new resources for each experiment, DECAF builds **indices** over datasets with existing linguistic annotations, and leverages them to analyze, filter, and generate highly controlled and reproducible experimental settings targeting specific research questions.  It maintains extensibility by constructing separate indices over raw text (literals) and annotations (structures).
 
@@ -45,8 +43,6 @@ structures = di.get_structure_counts()
 ```
 
 ## Building a Filter
-
-![](experiments/acl-demo/rsrc/reproducibility.png)
 
 DECAF treats indices and filters as independent entities from the original corpus. This means, that indices can be continually extended with new annotation layers, and that filters can be transferred across datasets.
 

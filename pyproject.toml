@@ -1,0 +1,35 @@
+[project]
+name = "decaffinate"
+version = "0.1"
+authors = [
+  { name="Max Müller-Eberstein", email="decaf@personads.me" },
+]
+description = "A Dynamically Extensible Corpus Analysis Framework"
+readme = "README.md"
+requires-python = ">=3.6"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent"
+]
+license = "MIT"
+
+[tool.setuptools.packages.find]
+exclude = ["experiments*", "venv*"]
+
+[project.optional-dependencies]
+full = [
+    "conllu>=6.0.0",
+    "matplotlib>=3.9.0",
+    "notebook>=7.3.0",
+    "numpy>=2.0.0",
+    "pandas>=2.2.0",
+    "scipy>=1.13.0",
+    "sqlparse>=0.5.0",
+]
+
+[project.urls]
+Homepage = "https://mxij.me/x/decaf"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
