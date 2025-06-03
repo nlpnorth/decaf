@@ -1,23 +1,9 @@
 import argparse
-import re
+import multiprocessing as mp
 import time
 
-from decaf.index import Literal, Structure, DecafIndex
-
-from conllu import TokenList, TokenTree, Token, parse_incr
-
-
-#
-# UD constants
-#
-
-# metadata to be carried over across sentences
-# format: 'regex' -> 'index field' / None (keep as is)
-METADATA_CARRYOVER = {
-	r'^newdoc( id)?': 'document',  # indicates start of new document (optionally with ID)
-	r'^newpar( id)?': 'paragraph',  # indicates start of new document (optionally with ID)
-	r'meta::.+': None  # GUM document-level metadata field (e.g., 'meta::dateCollected')
-}
+from decaf.formats.conllu import ConlluBatcher, ConlluParser
+from decaf.index import DecafIndex
 
 
 #
@@ -32,339 +18,10 @@ def parse_arguments():
 	parser.add_argument('--force-alignment', action='store_true', default=False, help='set flag to force alignment between tokens and text (default: False)')
 	parser.add_argument('--sentence-terminator', default=' ', help='terminator to add after each sentence (default: [space])')
 	parser.add_argument('--commit-steps', type=int, help='number of steps after which to perform a backup commit (default: None)')
+	parser.add_argument('--threads', type=int, default=mp.cpu_count(), help='number of workers (default: #CPUs)')
+	parser.add_argument('--batch-size', type=int, default=1, help='number of sentences per batch, overriden by document boundaries (default: 1)')
 	parser.add_argument('--shard-size', type=int, default=100000, help='number of sentences per shard (default: 100k)')
 	return parser.parse_args()
-
-
-def get_carryover_field(field):
-	for carryover_pattern, index_field in METADATA_CARRYOVER.items():
-		# check if metadata field matches carryover field pattern
-		if re.match(carryover_pattern, field) is None:
-			continue
-		# check if field requires name conversion
-		if index_field is None:
-			return field
-		else:
-			return index_field
-	# return None is examined field is not for carryover
-	return None
-
-
-#
-# parser functions
-#
-
-def parse_token(token:Token, cursor_idx:int, literal_level:str) -> tuple[list[Literal], list[Structure], list[tuple[Structure, Structure]]]:
-	literals, structures, hierarchies = [], [], []
-
-	# create literals from characters
-	if literal_level == 'character':
-		for character_idx, character in enumerate(token['form']):
-			literals.append(
-				Literal(start=cursor_idx + character_idx, end=cursor_idx + character_idx + 1, value=character)
-			)
-	# create literals from tokens
-	elif literal_level == 'token':
-		literals.append(Literal(start=cursor_idx, end=cursor_idx + len(token['form']), value=token['form']))
-	else:
-		raise ValueError(f"Unknown literal level: '{literal_level}'.")
-
-	# create structures from UD's token-level annotations
-	# https://universaldependencies.org/format.html
-	start_idx, end_idx = cursor_idx, cursor_idx + len(token['form'])
-	# token's surface form
-	token_structure = Structure(
-		start=start_idx, end=end_idx,
-		value=None, stype='token',  # value=None as it's constructed from its literals
-		literals=[l for l in literals]
-	)
-	structures.append(token_structure)
-	# create structures from other token-level annotations
-	for annotation in token:
-		# skip redundant annotations (UD ID, dep-tuple)
-		if annotation in {'id', 'deps', 'form'}:
-			continue
-		# skip empty annotation fields
-		elif token[annotation] is None:
-			continue
-		# split multi-value annotation fields into individual structures
-		elif type(token[annotation]) is dict:
-			for misc_annotation, misc_value in token[annotation].items():
-				structures.append(
-					Structure(
-						start=start_idx, end=end_idx,
-						value=misc_value, stype=misc_annotation,
-						literals=[l for l in literals]
-					)
-				)
-				hierarchies.append((token_structure, structures[-1]))
-		# all other annotations are stored as token-level structures
-		else:
-			structures.append(
-				Structure(
-					start=start_idx, end=end_idx,
-					value=token[annotation], stype=annotation,
-					literals=[l for l in literals]
-				)
-			)
-			hierarchies.append((token_structure, structures[-1]))
-
-	return literals, structures, hierarchies
-
-
-def parse_dependencies(tree:TokenTree, token_structures:dict[int, Structure]):
-	structures, hierarchies = [], []
-
-	relation = tree.token['deprel']
-	token_id = tree.token['id']
-	literals = [l for l in token_structures[token_id].literals]
-	start_idx, end_idx = token_structures[token_id].start, token_structures[token_id].end
-
-	# recursively process child nodes
-	children = []  # store direct children for hierarchy
-	for child in tree.children:
-		child_structures, child_hierarchies, child_literals = parse_dependencies(tree=child, token_structures=token_structures)
-		children.append(child_structures[0])
-		structures += child_structures
-		hierarchies += child_hierarchies
-		literals += child_literals
-		start_idx = min(start_idx, token_structures[child.token['id']].start)
-		end_idx = max(end_idx, token_structures[child.token['id']].end)
-
-	# append parent structure
-	dependency = Structure(
-		start=start_idx, end=end_idx,
-		value=relation, stype='dependency',
-		literals=[l for l in literals]
-	)
-	hierarchies += \
-		[(dependency, token_structures[token_id])] + \
-		[(dependency, child) for child in children]
-	structures = [dependency] + structures
-
-	return structures, hierarchies, literals
-
-
-def parse_sentence(sentence:TokenList, cursor_idx:int, literal_level:str, force_alignment:bool=False, sentence_terminator:str='') -> tuple[list[Literal], list[Structure], list[tuple[Structure,Structure]], dict]:
-	literals, structures, hierarchies = [], [], []
-	carryover = {}
-
-	# parse tokens in sentence
-	sentence_tokens = [token for token in sentence if type(token['id']) is not tuple]  # remove multi-tokens (e.g. "It's" -> "It 's"), identified by ID with range (e.g., '3-4')
-	text_cursor_idx = 0  # position within sentence
-	tokens_by_id = {}
-	for token_idx, token in enumerate(sentence_tokens):
-		# process token
-		token_literals, token_structures, token_hierarchies = parse_token(
-			token, cursor_idx + text_cursor_idx,
-			literal_level=literal_level
-		)
-		literals += token_literals
-		structures += token_structures
-		hierarchies += token_hierarchies
-		tokens_by_id[token['id']] = token_structures[0]
-		text_cursor_idx += sum(len(tl.value) for tl in token_literals)
-
-		# add trailing whitespaces
-		if force_alignment:
-			# scan for continuation in sentence text
-			while (text_cursor_idx < len(sentence.metadata['text']) - 1) and (re.match(r'\s', sentence.metadata['text'][text_cursor_idx])):
-				literals.append(
-					Literal(
-						start=cursor_idx + text_cursor_idx,
-						end=cursor_idx + text_cursor_idx + 1,
-						value=sentence.metadata['text'][text_cursor_idx])
-				)
-				token_structures[0].literals.append(literals[-1])
-				text_cursor_idx += 1
-		else:
-			# add default whitespace
-			literals.append(
-				Literal(
-					start=cursor_idx + text_cursor_idx,
-					end=cursor_idx + text_cursor_idx + 1,
-					value=' ')
-			)
-			token_structures[0].literals.append(literals[-1])
-			text_cursor_idx += 1
-
-		# add intermediate, non-token literal (e.g., whitespaces)
-		# intermediate_literal = ''
-		# while text_cursor_idx < len(sentence.metadata['text']):
-		# 	# fast-forward through whitespaces
-		# 	if re.match(r'\s', sentence.metadata['text'][text_cursor_idx]):
-		# 		intermediate_literal += sentence.metadata['text'][text_cursor_idx]
-		# 		text_cursor_idx += 1
-		# 		continue
-		# 	# check for next token
-		# 	if token_idx < len(sentence_tokens) - 1:
-		# 		# remove all incorrectly added whitespaces for comparison
-		# 		next_token = re.sub(r'\s', '', sentence_tokens[token_idx + 1]['form'])
-		# 		sentence_continuation =  re.sub(r'\s', '', sentence.metadata['text'][text_cursor_idx:])
-		# 		if sentence_continuation.startswith(next_token):
-		# 			break
-		# 	# increment cursor, and ignore non-whitespace characters
-		# 	intermediate_literal += ' '
-		# 	text_cursor_idx += 1
-		#
-		# if len(intermediate_literal) > 0:
-		# 	literals.append(
-		# 		Literal(
-		# 			start=cursor_idx + text_cursor_idx - len(intermediate_literal),
-		# 			end=cursor_idx + text_cursor_idx,
-		# 			value=intermediate_literal)
-		# 	)
-
-	# add sentence terminator
-	if sentence_terminator:
-		literals.append(
-			Literal(
-				start=cursor_idx + text_cursor_idx,
-				end=cursor_idx + text_cursor_idx + 1,
-				value=sentence_terminator)
-		)
-		text_cursor_idx += 1
-
-	# create hierarchical dependency structures
-	dependency_structures, dependency_hierarchies, _ = parse_dependencies(
-		tree=sentence.to_tree(),
-		token_structures=tokens_by_id
-	)
-	structures = dependency_structures + structures
-	hierarchies = dependency_hierarchies + hierarchies
-
-	# create structures from UD's sentence-level annotations
-	start_idx, end_idx = cursor_idx, cursor_idx + text_cursor_idx
-	# sentence structure itself
-	sentence_structure = Structure(
-		start=start_idx, end=end_idx,
-		value=None, stype='sentence',
-		literals=[l for l in literals]
-	)
-	sentence_structures = [sentence_structure]
-	# sentence metadata
-	for meta_field, meta_value in sentence.metadata.items():
-		# extract special carryover metadata ('newdoc id', 'newpar id', 'newpar', ...)
-		carryover_field = get_carryover_field(meta_field)
-		if carryover_field is not None:
-			carryover[carryover_field] = (meta_value, start_idx)
-			continue
-		# skip redundant UD field (text)
-		if meta_field == 'text':
-			continue
-		# all other metadata are stored as sentence-level structures
-		sentence_structures.append(
-			Structure(
-				start=start_idx, end=end_idx,
-				value=meta_value, stype=meta_field,
-				literals=[l for l in literals]
-			)
-		)
-
-	# establish sentence-level hierarchies
-	hierarchies += \
-			[(sentence_structure, token) for token in tokens_by_id.values()] + \
-			[(sentence_structure, dependency) for dependency in dependency_structures] + \
-			[(sentence_structure, sentence_annotation) for sentence_annotation in sentence_structures[1:]]
-
-	structures = sentence_structures + structures
-
-	return literals, structures, hierarchies, carryover
-
-
-def parse_carryover(
-		carryover:dict, next_carryover:dict,
-		literals:dict[str, list[Literal]], next_literals:list[Literal],
-		sentences:dict[str, list[Structure]], next_sentence:Structure,
-		cursor_idx:int
-) -> tuple[dict, dict[str, list[Literal]], dict[str, list[Structure]], list[Structure], list[tuple[Structure,Structure]]]:
-	output_structures = []
-	output_hierarchies = []
-
-	# check if paragraph (or document) changed
-	if ('paragraph' in next_carryover) or ('document' in next_carryover):
-		# store previous paragraph information
-		if 'paragraph' in carryover:
-			paragraph_id, paragraph_start_idx = carryover['paragraph']
-			paragraph = Structure(
-					start=paragraph_start_idx, end=cursor_idx,
-					value=None, stype='paragraph',
-					literals=[l for l in literals['paragraph']]
-				)
-			output_structures.append(paragraph)
-
-			if paragraph_id:
-				output_structures.append(
-					Structure(
-						start=paragraph_start_idx, end=cursor_idx,
-						value=paragraph_id, stype='paragraph_id',
-						literals=[l for l in literals['paragraph']]
-					)
-				)
-
-			# add hierarchical structures at paragraph-level
-			output_hierarchies += [
-				(paragraph, sentence_structure)
-				for sentence_structure in sentences['paragraph']
-			]
-
-		# reset parameter-level carryover
-		next_carryover['paragraph'] = next_carryover.get('paragraph', (None, cursor_idx))
-		literals['paragraph'] = []
-		sentences['paragraph'] = []
-
-	# check if document changed
-	if 'document' in next_carryover:
-		document = None
-
-		# create document-level structures and flush metadata
-		if 'document' in carryover:
-			for co_field, (co_value, co_start) in carryover.items():
-				# create separate document and document ID structures
-				if co_field == 'document':
-					document =Structure(
-							start=co_start, end=cursor_idx,
-							value=None, stype='document',
-							literals=[l for l in literals['document']]
-						)
-					co_field = 'document_id'
-
-				# skip re-processing of paragraph metadata
-				if co_field == 'paragraph':
-					continue
-
-				# add remaining document-level metadata
-				output_structures.append(
-					Structure(
-						start=co_start, end=cursor_idx,
-						value=co_value, stype=co_field,
-						literals=[l for l in literals['document']]
-					)
-				)
-
-		# add document-level hierarchical structures
-		if document is not None:
-			output_hierarchies += [
-				(document, document_structure)
-				for document_structure in output_structures
-			]
-			output_hierarchies += [
-				(document, sentence_structure)
-				for sentence_structure in sentences['document']
-			]
-			# add document to output structures
-			output_structures = [document] + output_structures
-
-		# reset all carryover data
-		carryover = next_carryover
-		literals = {s:[] for s in next_carryover}
-		sentences = {s:[] for s in next_carryover}
-
-	# keep track of literals and sentences that are part of an ongoing carryover structure
-	literals = {s: v + next_literals for s, v in literals.items()}
-	sentences = {s: v + [next_sentence] for s, v in sentences.items()}
-
-	return carryover, literals, sentences, output_structures, output_hierarchies
 
 
 #
@@ -381,113 +38,66 @@ def main():
 	decaf_index = DecafIndex(index_path=args.output)
 	print(f"Connected to DECAF index at '{args.output}':")
 	print(decaf_index)
+	# initialize DECAF index
+	decaf_index.initialize()
+	print(f"Initialized index from scratch.")
 
-	# check if DECAF index contains entries
+	# initialize parser
+	conllu_parser = ConlluParser(
+		literal_level=args.literal_level,
+		force_alignment=args.force_alignment,
+		sentence_terminator=args.sentence_terminator
+	)
+	print(f"Loading UD treebank from '{args.input}'...", end='', flush=True)
+	# count total number of sentences
+	num_sentences = conllu_parser.get_size(file=args.input)
+	print(f"found {num_sentences} sentence(s).")
+
+	# initialize index-level variables
+	cursor_idx = 0
 	num_indexed_sentences = 0
-	if len(decaf_index.shards) > 0:
-		# retrieve number of previously indexed sentences
-		structure_counts = decaf_index.get_structure_counts()
-		num_indexed_sentences = structure_counts.get('sentence', 0)
-		print(f"Loaded {num_indexed_sentences} indexed sentence(s).")
-	# case: initialize index from scratch
-	else:
-		decaf_index.initialize()
-		print(f"Initialized index from scratch.")
+	start_time = time.time()
 
-	print(f"Loading UD treebank from '{args.input}'...")
+	# process sentences in batches
+	with ConlluBatcher(file=args.input) as batcher, decaf_index as di:
+		for batch in batcher.get_batches(batch_size=args.batch_size):
+			print(f"\x1b[1K\r[{num_indexed_sentences}/{num_sentences} | {num_indexed_sentences/num_sentences:.2%}] Building index...", end='', flush=True)
+			# parse batches
+			batch_cursor, batch_literals, batch_structures, batch_hierarchies = conllu_parser.parse(sentences=batch)
 
-	# get total number of sentences
-	with open(args.input) as fp:
-		num_sentences = sum(1 for line in fp if line.startswith('1\t'))
+			# update cursor to global offset
+			for batch_literal in batch_literals:
+				batch_literal.start += cursor_idx
+				batch_literal.end += cursor_idx
+			for batch_structure in batch_structures:
+				batch_structure.start += cursor_idx
+				batch_structure.end += cursor_idx
+			# increment global cursor
+			cursor_idx += batch_cursor
 
-	# ingest sentences into DECAF index
-	with open(args.input) as fp, decaf_index as di:
-		num_literals, num_structures, num_hierarchies = di.get_size()
-		cursor_idx = 0  # initialize character-level dataset cursor
-		carryover = {}  # initialize cross-sentence carryover metadata (e.g., document/paragraph info)
-		carryover_literals = {}  # initialize cross-sentence carryover literals for paragraphs and documents
-		carryover_sentences = {}  # initialize carryover sentences for paragraphs and documents
-
-		# iterate over sentences
-		start_time = time.time()
-		for sentence_idx, sentence in enumerate(parse_incr(fp)):
-			print(f"\x1b[1K\r[{sentence_idx + 1}/{num_sentences} | {(sentence_idx + 1)/num_sentences:.2%}] Building index...", end='', flush=True)
-			cur_literals, cur_structures, cur_hierarchies, cur_carryover = parse_sentence(
-				sentence, cursor_idx,
-				literal_level=args.literal_level,
-				force_alignment=args.force_alignment,
-				sentence_terminator=args.sentence_terminator
-			)
-			cur_sentence = cur_structures[0]
-
-			# process carryover metadata
-			carryover, carryover_literals, carryover_sentences, new_structures, new_hierarchies  = parse_carryover(
-				carryover, cur_carryover,
-				carryover_literals, cur_literals,
-				carryover_sentences, cur_sentence,
-				cursor_idx
-			)
-			cur_structures += new_structures
-			cur_hierarchies += new_hierarchies
-
-			# skip adding sentences that are already in the index
-			if sentence_idx + 1 <= num_indexed_sentences:
-				continue
-
-			# insert sentence-level literals, structures, and hierarchies into index
-			di.add(literals=cur_literals, structures=cur_structures, hierarchies=cur_hierarchies)
+			# import into index
+			di.add(literals=batch_literals, structures=batch_structures, hierarchies=batch_hierarchies)
+			num_indexed_sentences += len(batch)
 
 			# perform backup commit
-			if (args.commit_steps is not None) and (sentence_idx%args.commit_steps == 0):
+			if (args.commit_steps is not None) and (num_indexed_sentences%args.commit_steps == 0):
 				di.commit()
 				print(f"\nPerformed backup commit to index at '{args.output}'.")
 
-			# check if new shard should be created
-			if ((sentence_idx//args.shard_size) + 1) > len(di.shards):
-				# check for document boundary
-				if 'document' in carryover:
-					# wait for current document to end
-					if 'document' in cur_carryover:
-						di.add_shard()
-				else:
-					di.add_shard()
-
-			# increment character-level cursor by number of atoms (i.e., characters)
-			cursor_idx += sum(len(literal.value) for literal in cur_literals)
-
-		# process final carryover structures
-		if num_indexed_sentences < num_sentences:
-			_, _, _, new_structures, new_hierarchies = parse_carryover(
-				carryover, {'document': ('end', -1), 'paragraph': ('end', -1)},
-				carryover_literals, [],
-				carryover_sentences, None,
-				cursor_idx
-			)
-			di.add(literals=[], structures=new_structures, hierarchies=new_hierarchies)
+			# check if new shard should be created (batches respect document boundaries)
+			if (num_indexed_sentences//args.shard_size) > len(di.shards):
+				di.add_shard()
 
 		# compute number of added structures
-		new_num_literals, new_num_structures, new_num_hierarchies = di.get_size()
+		num_literals, num_structures, num_hierarchies = di.get_size()
 		end_time = time.time()
 
-		print("completed.")
-
-		# print statistics
-		# literal_counts = di.get_literal_counts()
-		# print(f"Literal Statistics ({sum(literal_counts.values())} total; {len(literal_counts)} unique):")
-		# for atom, count in sorted(literal_counts.items(), key=lambda i: i[1], reverse=True):
-		# 	print(f"  '{atom}': {count} occurrences")
-		#
-		# structure_counts = di.get_structure_counts()
-		# print(f"Structure Statistics ({sum(structure_counts.values())} total; {len(structure_counts)} unique):")
-		# for structure, count in sorted(structure_counts.items(), key=lambda i: i[1], reverse=True):
-		# 	print(f"  '{structure}': {count} occurrences")
-
 		print(
-			f"Built index with {len(di.shards)} shard(s) containing "
-			f"{new_num_literals} literals ({new_num_literals - num_literals} new) "
-			f"and {new_num_structures} structures ({new_num_structures - num_structures} new) "
-			f"with {new_num_hierarchies} hierarchical relations ({new_num_hierarchies - num_hierarchies} new) "
-			f"for {num_sentences} sentences "
+			f"\x1b[1K\rBuilt index with {len(di.shards)} shard(s) containing "
+			f"{num_literals} literals "
+			f"and {num_structures} structures "
+			f"with {num_hierarchies} hierarchical relations "
+			f"for {num_indexed_sentences} sentences "
 			f"from '{args.input}' "
 			f"in {end_time - start_time:.2f}s.")
 
