@@ -54,7 +54,7 @@ class DecafIndex:
 
 	def connect(self, shard=0):
 		if self.connected_shard != shard:
-			self.connection =  sqlite3.connect(self.shards[shard])
+			self.connection =  sqlite3.connect(self.shards[shard], check_same_thread=False)
 			self.connected_shard = shard
 		return self.connection
 
@@ -74,6 +74,18 @@ class DecafIndex:
 	@requires_connection
 	def commit(self):
 		self.connection.commit()
+
+	#
+	# helpers
+	#
+
+	@requires_connection
+	def _get_last_id(self, table):
+		cursor = self.connection.cursor()
+		cursor.execute(f'SELECT MAX(id) FROM {table}')
+		last_id = cursor.fetchone()[0]
+		last_id = 0 if last_id is None else last_id
+		return last_id
 
 	#
 	# sharding
@@ -128,14 +140,18 @@ class DecafIndex:
 	def _add_literals(self, literals:list[Literal]) -> list[Literal]:
 		cursor = self.connection.cursor()
 
+		# prepare literal IDs
+		literal_id = self._get_last_id(table='literals') + 1
 		for literal in literals:
 			# skip literals which already have an entry in the index (i.e., ID that is not None)
 			if literal.id is not None:
 				continue
-			# insert literal into table and get insertion ID
-			query = 'INSERT INTO literals (id, start, end, value) VALUES (?, ?, ?, ?)'
-			cursor.execute(query, literal.serialize())
-			literal.id = int(cursor.lastrowid)
+			literal.id = literal_id
+			literal_id += 1
+
+		# insert literals into table
+		query = 'INSERT INTO literals (id, start, end, value) VALUES (?, ?, ?, ?)'
+		cursor.executemany(query, [literal.serialize() for literal in literals])
 
 		return literals
 
@@ -143,21 +159,23 @@ class DecafIndex:
 	def _add_structures(self, structures:list[Structure]) -> list[Structure]:
 		cursor = self.connection.cursor()
 
+		# prepare structure IDs
 		structure_literals = []
+		structure_id = self._get_last_id(table='structures') + 1
 		for structure in structures:
 			assert all((literal.id is not None) for literal in structure.literals), f"[Error] Please make sure to add all literals to the index before adding the corresponding structures."
-
 			# skip structures which already have an entry in the index (i.e., ID that is not None)
 			if structure.id is not None:
 				continue
-
-			# insert the structure itself and get the insertion ID
-			query = 'INSERT INTO structures (id, start, end, type, value) VALUES (?, ?, ?, ?, ?)'
-			cursor.execute(query, structure.serialize())
-			structure.id = int(cursor.lastrowid)
+			structure.id = structure_id
+			structure_id += 1
 
 			# gather associated literals
 			structure_literals += [(structure.id, literal.id) for literal in structure.literals]
+
+		# insert the structure itself and get the insertion ID
+		query = 'INSERT INTO structures (id, start, end, type, value) VALUES (?, ?, ?, ?, ?)'
+		cursor.executemany(query, [structure.serialize() for structure in structures])
 
 		# map constituting literals to structures
 		query = 'INSERT INTO structure_literals (structure, literal) VALUES (?, ?)'
