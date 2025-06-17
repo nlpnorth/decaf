@@ -16,8 +16,10 @@ CONLLU_METADATA_CARRYOVER = {
 
 
 class ConlluBatcher:
-    def __init__(self, file):
+    def __init__(self, file, start=0, end=float('inf')):
         self.file = file
+        self.start = start
+        self.end = end
         self._file_pointer = None
 
     def __enter__(self):
@@ -27,6 +29,12 @@ class ConlluBatcher:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._file_pointer.close()
 
+    @staticmethod
+    def get_size(file):
+        with open(file) as fp:
+            num_sentences = sum(1 for line in fp if line.startswith('1\t'))
+        return num_sentences
+
     def get_boundary(self, sentence):
         for field in ['newdoc', 'newdoc id']:
             if field in sentence.metadata:
@@ -34,13 +42,19 @@ class ConlluBatcher:
         return None
 
     def get_batches(self, batch_size):
+        assert self._file_pointer is not None, f"[Error] ConlluBatcher must be used within a context manager."
+
         batch = []
 
         # iterate over all sentences
         in_boundary = False  # flag to check whether sentence falls within structural boundary
         for sentence_idx, sentence in enumerate(parse_incr(self._file_pointer)):
-            batch_complete = False
+            # seek ahead until offset (cannot call file.seek() because parser calls next())
+            if (sentence_idx < self.start) or (sentence_idx > self.end):
+                continue
+
             # check if batch has reached target size
+            batch_complete = False
             if len(batch) >= batch_size:
                 # check for new document boundary
                 if self.get_boundary(sentence):
@@ -73,11 +87,6 @@ class ConlluParser(FormatParser):
         self.literal_level = literal_level
         self.force_alignment = force_alignment
         self.sentence_terminator = sentence_terminator
-
-    def get_size(self, file):
-        with open(file) as fp:
-            num_sentences = sum(1 for line in fp if line.startswith('1\t'))
-        return num_sentences
 
     def get_carryover_field(self, field):
         for carryover_pattern, index_field in CONLLU_METADATA_CARRYOVER.items():
@@ -401,10 +410,10 @@ class ConlluParser(FormatParser):
 
         return literals, structures, hierarchies, carryover
 
-    def parse(self, sentences:list[TokenList]):
+    def parse(self, sentences:list[TokenList], cursor_idx:int=0):
         literals, structures, hierarchies = [], [], []
 
-        cursor_idx = 0  # initialize character-level dataset cursor
+        cursor_idx = int(cursor_idx) if cursor_idx else 0  # initialize character-level dataset cursor
         carryover = {}  # initialize cross-sentence carryover metadata (e.g., document/paragraph info)
         carryover_literals = {}  # initialize cross-sentence carryover literals for paragraphs and documents
         carryover_sentences = {}  # initialize carryover sentences for paragraphs and documents

@@ -54,6 +54,7 @@ class DecafIndex:
 
 	def connect(self, shard=0):
 		if self.connected_shard != shard:
+			self.disconnect()
 			self.connection =  sqlite3.connect(self.shards[shard], check_same_thread=False)
 			self.connected_shard = shard
 		return self.connection
@@ -124,9 +125,8 @@ class DecafIndex:
 	#
 
 	def add(self, literals:list[Literal], structures:list[Structure], hierarchies:list[tuple[Structure,Structure]]):
-		# connect to last shard
-		if (self.connection is None) or (self.connected_shard != len(self.shards) - 1):
-			assert len(self.shards) > 0, "[Error] Cannot write to index without shards."
+		# if not already connected to specific shard, connect to latest
+		if self.connection is None:
 			self.connect(shard=len(self.shards)-1)
 
 		# insert literals into index (this updates the associated literals' index IDs)
