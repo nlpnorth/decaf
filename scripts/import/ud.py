@@ -25,24 +25,25 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def gen_shard_batchers(conllu_file, batch_size, shard_size):
+def gen_shards(conllu_file, batch_size, shard_size):
     sentence_idx = 0
-    shard_start = 0
     num_shards = 0
+    shard_batches = []
     with ConlluBatcher(file=conllu_file) as batcher:
         for batch in batcher.get_batches(batch_size=batch_size):
             # check if new shard should be created (batches respect document boundaries)
             if (sentence_idx // shard_size) > num_shards:
-                yield num_shards, sentence_idx, ConlluBatcher(file=conllu_file, start=shard_start, end=sentence_idx)
-                shard_start = sentence_idx + 1
+                yield num_shards, sentence_idx, shard_batches
                 num_shards += 1
+                shard_batches = []
+            shard_batches.append(batch)
             sentence_idx += len(batch)
         if num_shards > 0:
-            yield num_shards, sentence_idx, ConlluBatcher(file=conllu_file, start=shard_start, end=sentence_idx)
+            yield num_shards, sentence_idx, shard_batches
             num_shards += 1
 
 
-def shard_worker(decaf_index, conllu_batcher, conllu_parser, shard, batch_size):
+def shard_worker(decaf_index, conllu_parser, shard, batches):
     cursor_idx = 0
     sentence_idx = 0
     shard_literal_ids = []
@@ -50,27 +51,35 @@ def shard_worker(decaf_index, conllu_batcher, conllu_parser, shard, batch_size):
 
     # connect to specified shard
     decaf_index.connect(shard=shard)
-    # open file pointer
-    with conllu_batcher as batcher:
-        # iterate over batches
-        for batch in batcher.get_batches(batch_size=batch_size):
-            # parse batch
-            batch_cursor, batch_literals, batch_structures, batch_hierarchies = conllu_parser.parse(batch, cursor_idx=cursor_idx)
+    # iterate over batches
+    for batch in batches:
+        # parse batch
+        batch_cursor, batch_literals, batch_structures, batch_hierarchies = conllu_parser.parse(batch, cursor_idx=cursor_idx)
 
-            # write to database at relevant shard
-            decaf_index.add(literals=batch_literals, structures=batch_structures, hierarchies=batch_hierarchies)
+        # write to database at relevant shard
+        decaf_index.add(literals=batch_literals, structures=batch_structures, hierarchies=batch_hierarchies)
 
-            # gather literal/structure IDs
-            shard_literal_ids += [literal.id for literal in batch_literals]
-            shard_structure_ids += [structure.id for structure in batch_structures]
-            # update global cursors
-            cursor_idx = batch_cursor
-            sentence_idx += len(batch)
+        # gather literal/structure IDs
+        shard_literal_ids += [literal.id for literal in batch_literals]
+        shard_structure_ids += [structure.id for structure in batch_structures]
+        # update global cursors
+        cursor_idx = batch_cursor
+        sentence_idx += len(batch)
     # close database connection
     decaf_index.disconnect()
     del decaf_index
 
     return cursor_idx, sentence_idx, shard_literal_ids, shard_structure_ids
+
+
+def print_progress(num_sentences, num_indexed_sentences, num_shards, loading=False):
+    message = f"\x1b[1K\r[{num_indexed_sentences}/{num_sentences}"
+    if loading:
+        message += " | ···"
+    else:
+        message += f" | {num_indexed_sentences / num_sentences:.2%}"
+    message += f"] Building index with {num_shards} shard(s)..."
+    print(message, end='', flush=True)
 
 
 #
@@ -97,7 +106,7 @@ def main():
 
     # initialize sharding
     print(f"Loading UD treebank from '{args.input}'...", end='', flush=True)
-    shard_batchers = gen_shard_batchers(
+    shards = gen_shards(
         conllu_file=args.input, batch_size=args.batch_size, shard_size=args.shard_size
     )
 
@@ -110,14 +119,13 @@ def main():
     start_time = time.time()
     with mp.Pool(processes=args.threads) as pool:
         # process until all sentences have been indexed
-        while shard_batchers or (num_indexed_sentences < num_sentences):
+        while shards or (num_indexed_sentences < num_sentences):
             # submit shard processing jobs
-            if shard_batchers:
-                # print initial progress
-                print(f"\x1b[1K\r[{num_indexed_sentences}/{num_sentences}] Loading dataset into {num_shards} shard(s)...", end='', flush=True)
+            if shards and (len(shard_workers) < args.threads * 4):
+                print_progress(num_sentences, num_indexed_sentences, num_shards, loading=True)
                 # gather next shard batcher
                 try:
-                    shard_idx, shard_sentence_idx, shard_batcher = next(shard_batchers)
+                    shard_idx, shard_sentence_idx, shard_batches = next(shards)
                     num_shards = int(shard_idx+1)
                     num_sentences = int(shard_sentence_idx)
 
@@ -128,12 +136,12 @@ def main():
                     # submit shard processing to pool
                     shard_job = pool.apply_async(
                         shard_worker,
-                        (copy.deepcopy(decaf_index), copy.deepcopy(shard_batcher), copy.deepcopy(conllu_parser), shard_idx, args.batch_size)
+                        (copy.deepcopy(decaf_index), conllu_parser, shard_idx, shard_batches)
                     )
                     shard_workers[shard_idx] = shard_job
                 # clear generator after batcher exhaustion
                 except StopIteration:
-                    shard_batchers = None
+                    shards = None
 
             # gather completed jobs
             for job_shard_idx in list(shard_workers.keys()):
@@ -150,14 +158,15 @@ def main():
                     # remove from active jobs
                     del shard_workers[job_shard_idx]
                     # print progress
-                    print(f"\x1b[1K\r[{num_indexed_sentences}/{num_sentences} | {num_indexed_sentences / num_sentences:.2%}] Building index with {num_shards} shard(s)...", end='', flush=True)
+                    print_progress(num_sentences, num_indexed_sentences, num_shards, loading=(shards is not None))
                 except Exception as exception:
                     print(f"[Error] Could not process shard {job_shard_idx}:\n{exception}")
                     raise exception
 
+    end_time = time.time()
+
     # compute number of added structures
     num_literals, num_structures, num_hierarchies = decaf_index.get_size()
-    end_time = time.time()
 
     print(
         f"\x1b[1K\rBuilt index with {len(decaf_index.shards)} shard(s) containing "

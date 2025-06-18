@@ -1,3 +1,4 @@
+import multiprocessing as mp
 import os
 import re
 import sqlite3
@@ -55,7 +56,7 @@ class DecafIndex:
 	def connect(self, shard=0):
 		if self.connected_shard != shard:
 			self.disconnect()
-			self.connection =  sqlite3.connect(self.shards[shard], check_same_thread=False)
+			self.connection = sqlite3.connect(self.shards[shard], check_same_thread=False)
 			self.connected_shard = shard
 		return self.connection
 
@@ -119,6 +120,22 @@ class DecafIndex:
 			schema = fp.read()
 		cursor.executescript(schema)
 		self.commit()
+
+	@staticmethod
+	def _query_shard(query, shard):
+		with sqlite3.connect(shard, check_same_thread=False) as connection:
+			cursor = connection.cursor()
+			cursor.execute(query)
+			return cursor.fetchall()
+
+	def query_shards(self, query):
+		num_cpus = mp.cpu_count()  # parallelize across all CPUs
+		chunksize = max(1, len(self.shards) // num_cpus)  # give each process the same number of shards
+		shard_queries = [(query, shard) for shard in self.shards]
+		with mp.Pool(processes=num_cpus) as pool:
+			for shard_results in pool.starmap(self._query_shard, shard_queries, chunksize=chunksize):
+				for shard_result in shard_results:
+					yield shard_result
 
 	#
 	# import functions
@@ -353,17 +370,14 @@ class DecafIndex:
 	def get_size(self):
 		num_literals, num_structures, num_hierarchies = 0, 0, 0
 
-		for connection in self.connections():
-			cursor = connection.cursor()
+		for num_shard_literals in self.query_shards(query='SELECT COUNT(id) FROM literals'):
+			num_literals += num_shard_literals[0]
 
-			cursor.execute('SELECT COUNT(id) FROM literals')
-			num_literals += cursor.fetchone()[0]
+		for num_shard_structures in self.query_shards(query='SELECT COUNT(id) FROM structures'):
+			num_structures += num_shard_structures[0]
 
-			cursor.execute('SELECT COUNT(id) FROM structures')
-			num_structures += cursor.fetchone()[0]
-
-			cursor.execute('SELECT COUNT(parent) FROM hierarchical_structures')
-			num_hierarchies += cursor.fetchone()[0]
+		for num_shard_hierarchies in self.query_shards(query='SELECT COUNT(parent) FROM hierarchical_structures'):
+			num_hierarchies += num_shard_hierarchies[0]
 
 		return num_literals, num_structures, num_hierarchies
 
