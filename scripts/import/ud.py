@@ -38,7 +38,7 @@ def gen_shards(conllu_file, batch_size, shard_size):
                 shard_batches = []
             shard_batches.append(batch)
             sentence_idx += len(batch)
-        if num_shards > 0:
+        if len(shard_batches) > 0:
             yield num_shards, sentence_idx, shard_batches
             num_shards += 1
 
