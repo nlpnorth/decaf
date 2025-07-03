@@ -128,14 +128,25 @@ class DecafIndex:
 			cursor.execute(query)
 			return cursor.fetchall()
 
-	def query_shards(self, query):
-		num_cpus = mp.cpu_count()  # parallelize across all CPUs
+	def query_shards(self, queries):
+		num_cpus = max(1, mp.cpu_count()//2)  # parallelize across half of all CPUs
 		chunksize = max(1, len(self.shards) // num_cpus)  # give each process the same number of shards
-		shard_queries = [(query, shard) for shard in self.shards]
+
+		# if singular query, use the same across all shards
+		if len(queries) == 1:
+			shard_queries = [(queries[0], shard) for shard in self.shards]
+		# check if each shard receives its own query
+		elif len(queries) != len(self.shards):
+			raise ValueError(f'The number of queries ({len(queries)}) does not match the number of shards ({len(self.shards)}).')
+		# pair each shard with its query
+		else:
+			shard_queries = [(query, shard) for query, shard in zip(queries, self.shards)]
+
+		# distribute queries across shards
 		with mp.Pool(processes=num_cpus) as pool:
-			for shard_results in pool.starmap(self._query_shard, shard_queries, chunksize=chunksize):
+			for shard_idx, shard_results in enumerate(pool.starmap(self._query_shard, shard_queries, chunksize=chunksize)):
 				for shard_result in shard_results:
-					yield shard_result
+					yield shard_idx, shard_result
 
 	#
 	# import functions
@@ -234,11 +245,9 @@ class DecafIndex:
 		for shard, structure in structures:
 			structures_by_shard[shard].append(structure)
 
-		# run per-shard retrieval
-		shard_exports = {}
+		# construct shard-wise queries
+		queries = []
 		for shard, shard_structures in structures_by_shard.items():
-			self.connect(shard=shard)
-			cursor = self.connection.cursor()
 			query = f'''
 				SELECT structures.id, GROUP_CONCAT(literals.value, "") as export 
 				FROM (
@@ -250,9 +259,12 @@ class DecafIndex:
 				JOIN literals 
 				ON (structure_literals.structure = structures.id AND structure_literals.literal = literals.id) 
 				GROUP BY structures.id'''
-			cursor.execute(query)
-			shard_exports[shard] = {sid:export for sid, export in cursor.fetchall()}
-		self.disconnect()
+			queries.append(query)
+
+		# execute queries across shards
+		shard_exports = {s:{} for s in range(len(self.shards))}
+		for shard_idx, (structure_id, export) in self.query_shards(queries=queries):
+			shard_exports[shard_idx][structure_id] = export
 
 		# export in original order
 		for shard, structure in structures:
@@ -266,10 +278,9 @@ class DecafIndex:
 		for shard, structure in masked_structures:
 			structures_by_shard[shard].append(structure)
 
-		# run per-shard retrieval
+		# construct shard-wise queries
+		queries = []
 		for shard, shard_structures in structures_by_shard.items():
-			self.connect(shard=shard)
-			cursor = self.connection.cursor()
 			query = f'''
 				SELECT GROUP_CONCAT(value, "") as export
 				FROM literals
@@ -283,9 +294,11 @@ class DecafIndex:
 				    ) AS structure_literals
 				    ON (structure_literals.literal = literals.id)
 				)'''
-			cursor.execute(query)
-			export += cursor.fetchone()[0]
-		self.disconnect()
+			queries.append(query)
+
+		# execute queries across shards
+		for shard_export in self.query_shards(queries=queries):
+			export += shard_export
 
 		return export
 
@@ -332,26 +345,23 @@ class DecafIndex:
 		return query
 
 	def get_filter_ranges(self, constraint, output_level='structures'):
-		for shard_idx, connection in enumerate(self.connections()):
-			cursor = self.connection.cursor()
-
-			# execute constructed query
-			query = self._construct_filter_query(
-				constraint=constraint,
-				output_level=output_level
-			)
-			cursor.execute(query)
-
-			for structure_id, start, end in cursor.fetchall():
-				yield shard_idx, structure_id, start, end
-
-	def filter(self, constraint, output_level='structures'):
-		filter_ranges = self.get_filter_ranges(
+		# convert constraint to filter query
+		query = self._construct_filter_query(
 			constraint=constraint,
 			output_level=output_level
 		)
-		for shard_idx, structure_id, start, end in filter_ranges:
-			yield shard_idx, structure_id, start, end, next(self.export_structures([(shard_idx, structure_id)]))
+		# gather results across shards
+		for shard_idx, (structure_id, start, end) in self.query_shards(queries=[query]):
+			yield shard_idx, structure_id, start, end
+
+	def filter(self, constraint, output_level='structures'):
+		filter_ranges = list(self.get_filter_ranges(
+			constraint=constraint,
+			output_level=output_level
+		))
+		exports = self.export_structures(structures=[(shard_idx, structure_id) for shard_idx, structure_id, start, end in filter_ranges])
+		for (shard_idx, structure_id, start, end), export in zip(filter_ranges, exports):
+			yield shard_idx, structure_id, start, end, export
 
 	def mask(self, constraint, mask_level='structures', clean_whitespace=True):
 		filter_ranges = self.get_filter_ranges(
@@ -370,13 +380,13 @@ class DecafIndex:
 	def get_size(self):
 		num_literals, num_structures, num_hierarchies = 0, 0, 0
 
-		for num_shard_literals in self.query_shards(query='SELECT COUNT(id) FROM literals'):
+		for shard_idx, num_shard_literals in self.query_shards(queries=['SELECT COUNT(id) FROM literals']):
 			num_literals += num_shard_literals[0]
 
-		for num_shard_structures in self.query_shards(query='SELECT COUNT(id) FROM structures'):
+		for shard_idx, num_shard_structures in self.query_shards(queries=['SELECT COUNT(id) FROM structures']):
 			num_structures += num_shard_structures[0]
 
-		for num_shard_hierarchies in self.query_shards(query='SELECT COUNT(parent) FROM hierarchical_structures'):
+		for shard_idx, num_shard_hierarchies in self.query_shards(queries=['SELECT COUNT(parent) FROM hierarchical_structures']):
 			num_hierarchies += num_shard_hierarchies[0]
 
 		return num_literals, num_structures, num_hierarchies
@@ -384,11 +394,8 @@ class DecafIndex:
 	def get_literal_counts(self):
 		literal_counts = {}
 
-		for connection in self.connections():
-			cursor = connection.cursor()
-			cursor.execute('SELECT value, COUNT(value) AS total FROM literals GROUP BY value')
-			for literal, count in cursor.fetchall():
-				literal_counts[literal] = literal_counts.get(literal, 0) + count
+		for shard_idx, (literal, count) in self.query_shards(queries=['SELECT value, COUNT(value) AS total FROM literals GROUP BY value']):
+			literal_counts[literal] = literal_counts.get(literal, 0) + count
 
 		return literal_counts
 
@@ -422,14 +429,13 @@ class DecafIndex:
 			'''
 			structure_table = '(' + structure_table + ')'
 
-		for connection in self.connections():
-			cursor = connection.cursor()
-			cursor.execute(f'SELECT {fields}, COUNT(*) AS total FROM {structure_table} GROUP BY {fields}')
-			for row in cursor.fetchall():
-				structure = row[:-1]
-				if len(structure) == 1:
-					structure = structure[0]
-				structure_counts[structure] = structure_counts.get(structure, 0) + row[-1]
+		# compile full query
+		query = f'SELECT {fields}, COUNT(*) AS total FROM {structure_table} GROUP BY {fields}'
+		for shard_idx, row in self.query_shards(queries=[query]):
+			structure = row[:-1]
+			if len(structure) == 1:
+				structure = structure[0]
+			structure_counts[structure] = structure_counts.get(structure, 0) + row[-1]
 
 		return structure_counts
 
@@ -438,7 +444,7 @@ class DecafIndex:
 		try:
 			import pandas as pd
 		except ImportError as error:
-			print(f"[Error] To run analyze more complex statistics, please install external dependencies:\n> pip install decaf[full]")
+			print(f"[Error] To run analyze more complex statistics, please install external dependencies:\n> pip install decaffinate[full]")
 			raise error
 		# build co-occurrence frame
 		cooccurrence = pd.DataFrame(dtype=int)
@@ -474,24 +480,22 @@ class DecafIndex:
 		'''
 		query = source_views + ', ' + target_views[5:] + query
 
-		# iterate over shards
-		for connection in self.connections():
-			shard_co = pd.read_sql_query(query, connection)
+		# execute query across shards
+		source_target_frequencies = {}
+		for shard_idx, (source, target, frequency) in self.query_shards(queries=[query]):
+			source_target_frequencies[(source, target)] = source_target_frequencies.get((source, target), 0) + frequency
 
-			# pivot co-occurrence rows to become a matrix
-			shard_co = shard_co.pivot(
-			    index='sources',
-			    columns='targets',
-			    values='frequency'
-			).fillna(0)
+		# convert to dataframe
+		cooccurrence = pd.DataFrame([
+			{'sources': source, 'targets': target, 'frequency': frequency}
+			for (source, target), frequency in source_target_frequencies.items()
+		])
 
-			# merge across shards
-			shard_co = shard_co.reindex(
-				index=set().union(cooccurrence.index, shard_co.index),
-				columns=set().union(cooccurrence.columns, shard_co.columns),
-				fill_value=0
-			)  # fill in missing columns
-			cooccurrence = cooccurrence.add(shard_co, fill_value=0)
-
+		# pivot co-occurrence rows to become a matrix
+		cooccurrence = cooccurrence.pivot(
+		    index='sources',
+		    columns='targets',
+		    values='frequency'
+		).fillna(0)
 		cooccurrence = cooccurrence.astype(int)
 		return cooccurrence
