@@ -7,6 +7,7 @@ from importlib import resources
 
 from decaf.index import Literal, Structure
 from decaf.index.views import construct_views
+from decaf.filters import Filter, Criterion, Condition
 
 
 #
@@ -374,7 +375,7 @@ class DecafIndex:
 		return export
 
 	#
-	# statistics functions
+	# analysis functions
 	#
 
 	def get_size(self):
@@ -439,6 +440,59 @@ class DecafIndex:
 
 		return structure_counts
 
+	def get_structure_ngrams(self, types, hierarchy=None, literals=False, window=1):
+		structure_ngrams = {}
+
+		# gather fields to return
+		fields = []
+		if hierarchy:
+			fields += ['structure_id']
+		fields += ['substructure_id']
+		fields += [f'"type={stype}"' for stype in types]
+		fields += ['literal'] if literals else []
+
+		# construct filter
+		ngram_filter = Filter(
+			criteria=[
+				Criterion(
+					conditions=[
+						Condition(stype=stype, literals=['%'], match='LIKE') if literals else Condition(stype=stype)
+						for stype in types
+					],
+					operation='OR'
+				)
+				for _ in range(window)
+			],
+			sequential=True,
+			hierarchy=hierarchy
+		)
+
+		# construct views and query
+		views = construct_views(constraint=ngram_filter)
+		relevant_view = 'relevant_structures' if hierarchy else 'filtered_sequences'
+		query = f'{views} SELECT {", ".join(fields)} FROM {relevant_view}'
+
+		# execute query across shards
+		ngram_id, ngram = [], []
+		for shard_idx, result in self.query_shards(queries=[query]):
+			# gather result ID and values
+			result_id, values = (result[:2], result[2:]) if hierarchy else (result[:1], result[1:])
+			ngram_id.append((shard_idx, ) + result_id)
+			ngram.append(values)
+
+			# check for completed ngram
+			if len(ngram) == window:
+				ngram_id, ngram, ngram_valid = tuple(ngram_id), tuple(ngram), True
+				# check if ngram occurs within hierarchical parent structure
+				if hierarchy and (len({part_id[1] for part_id in ngram_id}) != 1):
+					ngram_valid = False
+				# add current ngram and reset
+				if ngram_valid:
+					structure_ngrams[ngram] = structure_ngrams.get(ngram, set()) | {ngram_id}
+				ngram_id, ngram = [], []
+
+		return structure_ngrams
+
 	def get_cooccurrence(self, source_filter, target_filter):
 		# try importing Pandas
 		try:
@@ -446,8 +500,6 @@ class DecafIndex:
 		except ImportError as error:
 			print(f"[Error] To run analyze more complex statistics, please install external dependencies:\n> pip install decaffinate[full]")
 			raise error
-		# build co-occurrence frame
-		cooccurrence = pd.DataFrame(dtype=int)
 
 		# prepare views for easier retrieval
 		source_views = construct_views(constraint=source_filter, view_prefix='source_')
