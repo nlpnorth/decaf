@@ -68,10 +68,9 @@ def main():
 		print('```')
 		print("Querying index...")
 		query_start_time = time.time()
+		query_total_time = 0
 
 		outputs = di.filter(constraint=constraint, output_level=output_level)
-
-		query_end_time = time.time()
 
 		# initialize output file pointer (if specified)
 		output_file = None
@@ -80,10 +79,12 @@ def main():
 
 		num_matches = 0
 		for shard_idx, structure_id, start, end, export in outputs:
+			query_total_time += time.time() - query_start_time
 			print(f"\n[ID ({shard_idx}/{structure_id}) | {start}-{end}] '{export}'")
 			if output_file is not None:
 				output_file.write(export + '\n')
 			num_matches += 1
+			query_start_time = time.time()
 
 		if output_file is not None:
 			output_file.close()
@@ -92,7 +93,7 @@ def main():
 	print(
 		f"\nCompleted retrieval of {num_matches} match(es) from DECAF index "
 		f"with {num_literals} literal(s) and {num_structures} structure(s) "
-		f"in {query_end_time - query_start_time:.2f}s."
+		f"in {query_total_time:.2f}s."
 	)
 
 
