@@ -1,6 +1,6 @@
 [project]
 name = "decaffinate"
-version = "0.1"
+version = "0.2"
 authors = [
   { name="Max Müller-Eberstein", email="decaf@personads.me" },
 ]
