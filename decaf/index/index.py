@@ -375,6 +375,62 @@ class DecafIndex:
 		return export
 
 	#
+	# retrieval functions
+	#
+
+	def get_structures(self, stype, literals=False, hierarchy=None):
+		structures = {}
+
+		# gather literals
+		structure_literals = {}
+		if literals:
+			literals_query = f'''
+				SELECT structures.id AS structure_id, literals.id, literals.value, literals.start, literals.end
+				FROM (
+					(SELECT * FROM structures WHERE type = {stype}) AS structures 
+					JOIN structure_literals 
+					JOIN literals
+					ON (structure_literals.structure = structures.id AND structure_literals.literal = literals.id)
+				) ORDER BY start, end
+			'''
+			structure_literals = {}
+			for shard_idx, (structure_id, literal_id, value, start, end) in self.query_shards(queries=[literals_query]):
+				if structure_id not in structure_literals:
+					structure_literals[structure_id] = []
+				structure_literals[structure_id].append(Literal(
+					start=start, end=end, value=value, index_id=literal_id
+				))
+
+		# gather fields to return
+		fields = ['structure_id' if hierarchy else 'substructure_id']
+		fields += [f'"type={stype}"', 'start', 'end']
+
+		structure_filter = Filter(
+			criteria=[
+				Criterion(
+					conditions=[
+						Condition(stype=stype)
+					]
+				)
+			],
+			hierarchy=hierarchy
+		)
+		# construct views and query
+		views = construct_views(constraint=structure_filter)
+		relevant_view = 'filtered_constrained_substructures' if hierarchy else 'filtered_substructures'
+		query = f'{views} SELECT {", ".join(fields)} FROM {relevant_view}'
+
+		# execute query across shards
+		for shard_idx, (structure_id, value, start, end) in self.query_shards(queries=[query]):
+			structures[(shard_idx, structure_id)] = Structure(
+				index_id=structure_id, stype=stype, value=value,
+	            start=start, end=end,
+				literals=structure_literals.get(structure_id, None)
+	        )
+
+		return structures
+
+	#
 	# analysis functions
 	#
 
@@ -488,7 +544,9 @@ class DecafIndex:
 					ngram_valid = False
 				# add current ngram and reset
 				if ngram_valid:
-					structure_ngrams[ngram] = structure_ngrams.get(ngram, set()) | {ngram_id}
+					if ngram not in structure_ngrams:
+						structure_ngrams[ngram] = set()
+					structure_ngrams[ngram].add(ngram_id)
 				ngram_id, ngram = [], []
 
 		return structure_ngrams
