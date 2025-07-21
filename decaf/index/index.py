@@ -1,3 +1,4 @@
+import multiprocessing as mp
 import os
 import re
 import sqlite3
@@ -6,6 +7,7 @@ from importlib import resources
 
 from decaf.index import Literal, Structure
 from decaf.index.views import construct_views
+from decaf.filters import Filter, Criterion, Condition
 
 
 #
@@ -54,7 +56,8 @@ class DecafIndex:
 
 	def connect(self, shard=0):
 		if self.connected_shard != shard:
-			self.connection =  sqlite3.connect(self.shards[shard])
+			self.disconnect()
+			self.connection = sqlite3.connect(self.shards[shard], check_same_thread=False)
 			self.connected_shard = shard
 		return self.connection
 
@@ -74,6 +77,18 @@ class DecafIndex:
 	@requires_connection
 	def commit(self):
 		self.connection.commit()
+
+	#
+	# helpers
+	#
+
+	@requires_connection
+	def _get_last_id(self, table):
+		cursor = self.connection.cursor()
+		cursor.execute(f'SELECT MAX(id) FROM {table}')
+		last_id = cursor.fetchone()[0]
+		last_id = 0 if last_id is None else last_id
+		return last_id
 
 	#
 	# sharding
@@ -107,14 +122,40 @@ class DecafIndex:
 		cursor.executescript(schema)
 		self.commit()
 
+	@staticmethod
+	def _query_shard(query, shard):
+		with sqlite3.connect(shard, check_same_thread=False) as connection:
+			cursor = connection.cursor()
+			cursor.execute(query)
+			return cursor.fetchall()
+
+	def query_shards(self, queries):
+		num_cpus = max(1, mp.cpu_count()//2)  # parallelize across half of all CPUs
+		chunksize = max(1, len(self.shards) // num_cpus)  # give each process the same number of shards
+
+		# if singular query, use the same across all shards
+		if len(queries) == 1:
+			shard_queries = [(queries[0], shard) for shard in self.shards]
+		# check if each shard receives its own query
+		elif len(queries) != len(self.shards):
+			raise ValueError(f'The number of queries ({len(queries)}) does not match the number of shards ({len(self.shards)}).')
+		# pair each shard with its query
+		else:
+			shard_queries = [(query, shard) for query, shard in zip(queries, self.shards)]
+
+		# distribute queries across shards
+		with mp.Pool(processes=num_cpus) as pool:
+			for shard_idx, shard_results in enumerate(pool.starmap(self._query_shard, shard_queries, chunksize=chunksize)):
+				for shard_result in shard_results:
+					yield shard_idx, shard_result
+
 	#
 	# import functions
 	#
 
 	def add(self, literals:list[Literal], structures:list[Structure], hierarchies:list[tuple[Structure,Structure]]):
-		# connect to last shard
-		if (self.connection is None) or (self.connected_shard != len(self.shards) - 1):
-			assert len(self.shards) > 0, "[Error] Cannot write to index without shards."
+		# if not already connected to specific shard, connect to latest
+		if self.connection is None:
 			self.connect(shard=len(self.shards)-1)
 
 		# insert literals into index (this updates the associated literals' index IDs)
@@ -128,14 +169,18 @@ class DecafIndex:
 	def _add_literals(self, literals:list[Literal]) -> list[Literal]:
 		cursor = self.connection.cursor()
 
+		# prepare literal IDs
+		literal_id = self._get_last_id(table='literals') + 1
 		for literal in literals:
 			# skip literals which already have an entry in the index (i.e., ID that is not None)
 			if literal.id is not None:
 				continue
-			# insert literal into table and get insertion ID
-			query = 'INSERT INTO literals (id, start, end, value) VALUES (?, ?, ?, ?)'
-			cursor.execute(query, literal.serialize())
-			literal.id = int(cursor.lastrowid)
+			literal.id = literal_id
+			literal_id += 1
+
+		# insert literals into table
+		query = 'INSERT INTO literals (id, start, end, value) VALUES (?, ?, ?, ?)'
+		cursor.executemany(query, [literal.serialize() for literal in literals])
 
 		return literals
 
@@ -143,21 +188,23 @@ class DecafIndex:
 	def _add_structures(self, structures:list[Structure]) -> list[Structure]:
 		cursor = self.connection.cursor()
 
+		# prepare structure IDs
 		structure_literals = []
+		structure_id = self._get_last_id(table='structures') + 1
 		for structure in structures:
 			assert all((literal.id is not None) for literal in structure.literals), f"[Error] Please make sure to add all literals to the index before adding the corresponding structures."
-
 			# skip structures which already have an entry in the index (i.e., ID that is not None)
 			if structure.id is not None:
 				continue
-
-			# insert the structure itself and get the insertion ID
-			query = 'INSERT INTO structures (id, start, end, type, value) VALUES (?, ?, ?, ?, ?)'
-			cursor.execute(query, structure.serialize())
-			structure.id = int(cursor.lastrowid)
+			structure.id = structure_id
+			structure_id += 1
 
 			# gather associated literals
 			structure_literals += [(structure.id, literal.id) for literal in structure.literals]
+
+		# insert the structure itself and get the insertion ID
+		query = 'INSERT INTO structures (id, start, end, type, value) VALUES (?, ?, ?, ?, ?)'
+		cursor.executemany(query, [structure.serialize() for structure in structures])
 
 		# map constituting literals to structures
 		query = 'INSERT INTO structure_literals (structure, literal) VALUES (?, ?)'
@@ -199,11 +246,9 @@ class DecafIndex:
 		for shard, structure in structures:
 			structures_by_shard[shard].append(structure)
 
-		# run per-shard retrieval
-		shard_exports = {}
+		# construct shard-wise queries
+		queries = []
 		for shard, shard_structures in structures_by_shard.items():
-			self.connect(shard=shard)
-			cursor = self.connection.cursor()
 			query = f'''
 				SELECT structures.id, GROUP_CONCAT(literals.value, "") as export 
 				FROM (
@@ -215,9 +260,12 @@ class DecafIndex:
 				JOIN literals 
 				ON (structure_literals.structure = structures.id AND structure_literals.literal = literals.id) 
 				GROUP BY structures.id'''
-			cursor.execute(query)
-			shard_exports[shard] = {sid:export for sid, export in cursor.fetchall()}
-		self.disconnect()
+			queries.append(query)
+
+		# execute queries across shards
+		shard_exports = {s:{} for s in range(len(self.shards))}
+		for shard_idx, (structure_id, export) in self.query_shards(queries=queries):
+			shard_exports[shard_idx][structure_id] = export
 
 		# export in original order
 		for shard, structure in structures:
@@ -231,10 +279,9 @@ class DecafIndex:
 		for shard, structure in masked_structures:
 			structures_by_shard[shard].append(structure)
 
-		# run per-shard retrieval
+		# construct shard-wise queries
+		queries = []
 		for shard, shard_structures in structures_by_shard.items():
-			self.connect(shard=shard)
-			cursor = self.connection.cursor()
 			query = f'''
 				SELECT GROUP_CONCAT(value, "") as export
 				FROM literals
@@ -248,9 +295,11 @@ class DecafIndex:
 				    ) AS structure_literals
 				    ON (structure_literals.literal = literals.id)
 				)'''
-			cursor.execute(query)
-			export += cursor.fetchone()[0]
-		self.disconnect()
+			queries.append(query)
+
+		# execute queries across shards
+		for shard_export in self.query_shards(queries=queries):
+			export += shard_export
 
 		return export
 
@@ -297,26 +346,23 @@ class DecafIndex:
 		return query
 
 	def get_filter_ranges(self, constraint, output_level='structures'):
-		for shard_idx, connection in enumerate(self.connections()):
-			cursor = self.connection.cursor()
-
-			# execute constructed query
-			query = self._construct_filter_query(
-				constraint=constraint,
-				output_level=output_level
-			)
-			cursor.execute(query)
-
-			for structure_id, start, end in cursor.fetchall():
-				yield shard_idx, structure_id, start, end
-
-	def filter(self, constraint, output_level='structures'):
-		filter_ranges = self.get_filter_ranges(
+		# convert constraint to filter query
+		query = self._construct_filter_query(
 			constraint=constraint,
 			output_level=output_level
 		)
-		for shard_idx, structure_id, start, end in filter_ranges:
-			yield shard_idx, structure_id, start, end, next(self.export_structures([(shard_idx, structure_id)]))
+		# gather results across shards
+		for shard_idx, (structure_id, start, end) in self.query_shards(queries=[query]):
+			yield shard_idx, structure_id, start, end
+
+	def filter(self, constraint, output_level='structures'):
+		filter_ranges = list(self.get_filter_ranges(
+			constraint=constraint,
+			output_level=output_level
+		))
+		exports = self.export_structures(structures=[(shard_idx, structure_id) for shard_idx, structure_id, start, end in filter_ranges])
+		for (shard_idx, structure_id, start, end), export in zip(filter_ranges, exports):
+			yield shard_idx, structure_id, start, end, export
 
 	def mask(self, constraint, mask_level='structures', clean_whitespace=True):
 		filter_ranges = self.get_filter_ranges(
@@ -329,34 +375,84 @@ class DecafIndex:
 		return export
 
 	#
-	# statistics functions
+	# retrieval functions
+	#
+
+	def get_structures(self, stype, literals=False, hierarchy=None):
+		structures = {}
+
+		# gather literals
+		structure_literals = {}
+		if literals:
+			literals_query = f'''
+				SELECT structures.id AS structure_id, literals.id, literals.value, literals.start, literals.end
+				FROM (
+					(SELECT * FROM structures WHERE type = {stype}) AS structures 
+					JOIN structure_literals 
+					JOIN literals
+					ON (structure_literals.structure = structures.id AND structure_literals.literal = literals.id)
+				) ORDER BY start, end
+			'''
+			structure_literals = {}
+			for shard_idx, (structure_id, literal_id, value, start, end) in self.query_shards(queries=[literals_query]):
+				if structure_id not in structure_literals:
+					structure_literals[structure_id] = []
+				structure_literals[structure_id].append(Literal(
+					start=start, end=end, value=value, index_id=literal_id
+				))
+
+		# gather fields to return
+		fields = ['structure_id' if hierarchy else 'substructure_id']
+		fields += [f'"type={stype}"', 'start', 'end']
+
+		structure_filter = Filter(
+			criteria=[
+				Criterion(
+					conditions=[
+						Condition(stype=stype)
+					]
+				)
+			],
+			hierarchy=hierarchy
+		)
+		# construct views and query
+		views = construct_views(constraint=structure_filter)
+		relevant_view = 'filtered_constrained_substructures' if hierarchy else 'filtered_substructures'
+		query = f'{views} SELECT {", ".join(fields)} FROM {relevant_view}'
+
+		# execute query across shards
+		for shard_idx, (structure_id, value, start, end) in self.query_shards(queries=[query]):
+			structures[(shard_idx, structure_id)] = Structure(
+				index_id=structure_id, stype=stype, value=value,
+	            start=start, end=end,
+				literals=structure_literals.get(structure_id, None)
+	        )
+
+		return structures
+
+	#
+	# analysis functions
 	#
 
 	def get_size(self):
 		num_literals, num_structures, num_hierarchies = 0, 0, 0
 
-		for connection in self.connections():
-			cursor = connection.cursor()
+		for shard_idx, num_shard_literals in self.query_shards(queries=['SELECT COUNT(id) FROM literals']):
+			num_literals += num_shard_literals[0]
 
-			cursor.execute('SELECT COUNT(id) FROM literals')
-			num_literals += cursor.fetchone()[0]
+		for shard_idx, num_shard_structures in self.query_shards(queries=['SELECT COUNT(id) FROM structures']):
+			num_structures += num_shard_structures[0]
 
-			cursor.execute('SELECT COUNT(id) FROM structures')
-			num_structures += cursor.fetchone()[0]
-
-			cursor.execute('SELECT COUNT(parent) FROM hierarchical_structures')
-			num_hierarchies += cursor.fetchone()[0]
+		for shard_idx, num_shard_hierarchies in self.query_shards(queries=['SELECT COUNT(parent) FROM hierarchical_structures']):
+			num_hierarchies += num_shard_hierarchies[0]
 
 		return num_literals, num_structures, num_hierarchies
 
 	def get_literal_counts(self):
 		literal_counts = {}
 
-		for connection in self.connections():
-			cursor = connection.cursor()
-			cursor.execute('SELECT value, COUNT(value) AS total FROM literals GROUP BY value')
-			for literal, count in cursor.fetchall():
-				literal_counts[literal] = literal_counts.get(literal, 0) + count
+		for shard_idx, (literal, count) in self.query_shards(queries=['SELECT value, COUNT(value) AS total FROM literals GROUP BY value']):
+			literal_counts[literal] = literal_counts.get(literal, 0) + count
 
 		return literal_counts
 
@@ -390,26 +486,78 @@ class DecafIndex:
 			'''
 			structure_table = '(' + structure_table + ')'
 
-		for connection in self.connections():
-			cursor = connection.cursor()
-			cursor.execute(f'SELECT {fields}, COUNT(*) AS total FROM {structure_table} GROUP BY {fields}')
-			for row in cursor.fetchall():
-				structure = row[:-1]
-				if len(structure) == 1:
-					structure = structure[0]
-				structure_counts[structure] = structure_counts.get(structure, 0) + row[-1]
+		# compile full query
+		query = f'SELECT {fields}, COUNT(*) AS total FROM {structure_table} GROUP BY {fields}'
+		for shard_idx, row in self.query_shards(queries=[query]):
+			structure = row[:-1]
+			if len(structure) == 1:
+				structure = structure[0]
+			structure_counts[structure] = structure_counts.get(structure, 0) + row[-1]
 
 		return structure_counts
+
+	def get_structure_ngrams(self, types, hierarchy=None, literals=False, window=1):
+		structure_ngrams = {}
+
+		# gather fields to return
+		fields = []
+		if hierarchy:
+			fields += ['structure_id']
+		fields += ['substructure_id']
+		fields += [f'"type={stype}"' for stype in types]
+		fields += ['literal'] if literals else []
+
+		# construct filter
+		ngram_filter = Filter(
+			criteria=[
+				Criterion(
+					conditions=[
+						Condition(stype=stype, literals=['%'], match='LIKE') if literals else Condition(stype=stype)
+						for stype in types
+					],
+					operation='OR'
+				)
+				for _ in range(window)
+			],
+			sequential=True,
+			hierarchy=hierarchy
+		)
+
+		# construct views and query
+		views = construct_views(constraint=ngram_filter)
+		relevant_view = 'relevant_structures' if hierarchy else 'filtered_sequences'
+		query = f'{views} SELECT {", ".join(fields)} FROM {relevant_view}'
+
+		# execute query across shards
+		ngram_id, ngram = [], []
+		for shard_idx, result in self.query_shards(queries=[query]):
+			# gather result ID and values
+			result_id, values = (result[:2], result[2:]) if hierarchy else (result[:1], result[1:])
+			ngram_id.append((shard_idx, ) + result_id)
+			ngram.append(values)
+
+			# check for completed ngram
+			if len(ngram) == window:
+				ngram_id, ngram, ngram_valid = tuple(ngram_id), tuple(ngram), True
+				# check if ngram occurs within hierarchical parent structure
+				if hierarchy and (len({part_id[1] for part_id in ngram_id}) != 1):
+					ngram_valid = False
+				# add current ngram and reset
+				if ngram_valid:
+					if ngram not in structure_ngrams:
+						structure_ngrams[ngram] = set()
+					structure_ngrams[ngram].add(ngram_id)
+				ngram_id, ngram = [], []
+
+		return structure_ngrams
 
 	def get_cooccurrence(self, source_filter, target_filter):
 		# try importing Pandas
 		try:
 			import pandas as pd
 		except ImportError as error:
-			print(f"[Error] To run analyze more complex statistics, please install external dependencies:\n> pip install decaf[full]")
+			print(f"[Error] To run analyze more complex statistics, please install external dependencies:\n> pip install decaffinate[full]")
 			raise error
-		# build co-occurrence frame
-		cooccurrence = pd.DataFrame(dtype=int)
 
 		# prepare views for easier retrieval
 		source_views = construct_views(constraint=source_filter, view_prefix='source_')
@@ -442,24 +590,22 @@ class DecafIndex:
 		'''
 		query = source_views + ', ' + target_views[5:] + query
 
-		# iterate over shards
-		for connection in self.connections():
-			shard_co = pd.read_sql_query(query, connection)
+		# execute query across shards
+		source_target_frequencies = {}
+		for shard_idx, (source, target, frequency) in self.query_shards(queries=[query]):
+			source_target_frequencies[(source, target)] = source_target_frequencies.get((source, target), 0) + frequency
 
-			# pivot co-occurrence rows to become a matrix
-			shard_co = shard_co.pivot(
-			    index='sources',
-			    columns='targets',
-			    values='frequency'
-			).fillna(0)
+		# convert to dataframe
+		cooccurrence = pd.DataFrame([
+			{'sources': source, 'targets': target, 'frequency': frequency}
+			for (source, target), frequency in source_target_frequencies.items()
+		])
 
-			# merge across shards
-			shard_co = shard_co.reindex(
-				index=set().union(cooccurrence.index, shard_co.index),
-				columns=set().union(cooccurrence.columns, shard_co.columns),
-				fill_value=0
-			)  # fill in missing columns
-			cooccurrence = cooccurrence.add(shard_co, fill_value=0)
-
+		# pivot co-occurrence rows to become a matrix
+		cooccurrence = cooccurrence.pivot(
+		    index='sources',
+		    columns='targets',
+		    values='frequency'
+		).fillna(0)
 		cooccurrence = cooccurrence.astype(int)
 		return cooccurrence

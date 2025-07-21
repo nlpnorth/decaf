@@ -10,7 +10,7 @@ class Structure:
 		self.id = index_id
 
 	def __repr__(self):
-		return f'''<Structure (id={self.id}, loc={self.start}-{self.end}, {len(self.literals)} literals):  type='{self.type}', value='{self.value}'>'''
+		return f'''<Structure (id={self.id}, loc={self.start}-{self.end}, {len(self.literals) if self.literals else 'no'} literals):  type='{self.type}', value='{self.value}'>'''
 
 	def __hash__(self):
 		return hash(self.serialize())

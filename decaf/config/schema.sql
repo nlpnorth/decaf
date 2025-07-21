@@ -1,14 +1,14 @@
 CREATE TABLE literals (
     id INTEGER PRIMARY KEY,
-    start INTEGER NOT NULL ,
-    end INTEGER NOT NULL ,
+    start INTEGER NOT NULL,
+    end INTEGER NOT NULL,
     value TEXT NOT NULL
 );
 
 CREATE TABLE structures (
     id INTEGER PRIMARY KEY,
-    start INTEGER NOT NULL ,
-    end INTEGER NOT NULL ,
+    start INTEGER NOT NULL,
+    end INTEGER NOT NULL,
     type TEXT NOT NULL,
     value TEXT
 );
